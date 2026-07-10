@@ -18,6 +18,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <vector>
 #include <cuda_runtime_api.h>
+#include <cfloat>
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #define __CUDACC__
