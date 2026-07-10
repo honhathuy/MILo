@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16.3)
 project(fast_traversal LANGUAGES CXX CUDA)
 enable_language(CUDA)
+add_compile_options(-U_GLIBCXX_USE_CXX11_ABI -D_GLIBCXX_USE_CXX11_ABI=1)
 
 include(FetchContent)
 # Add paths to our CMake code to the module path, so they can be found automatically by
