@@ -13,6 +13,7 @@
 #define CUDA_RASTERIZER_BACKWARD_H_INCLUDED
 
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
@@ -24,12 +25,14 @@ namespace BACKWARD
 		const dim3 grid, const dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		const int num_classes, const int n_features, int W, int H,
 		const float* bg_color,
 		const float* view_points,
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
+		const float* semantic,
+		const float* gaussian_features,
 		const float* depths,
 		const float* ts,
 		const float* camera_planes,
@@ -41,6 +44,8 @@ namespace BACKWARD
 		const float* normal_length,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		const float* dL_dpixels_semantic,
+		const float* dL_dpixels_gaussian_features,
 		const float* dL_dpixel_coords,
 		const float* dL_dpixel_mcoords,
 		const float* dL_dpixel_depth,
@@ -55,6 +60,8 @@ namespace BACKWARD
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
+		float* dL_dsemantics,
+		float* dL_dgaussian_features,
 		float* dL_dts,
 		float* dL_dcamera_planes,
 		float2* dL_dray_planes,

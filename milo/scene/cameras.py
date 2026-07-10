@@ -12,12 +12,15 @@
 import torch
 from torch import nn
 import numpy as np
+import math
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 semantic_mask=None, depthmap=None, confidence_map=None, normalmap=None,
+                 depthloss=None
                  ):
         super(Camera, self).__init__()
 
@@ -47,6 +50,40 @@ class Camera(nn.Module):
             # self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
             self.gt_mask = None
 
+        if semantic_mask is not None:
+            if isinstance(semantic_mask, np.ndarray):
+                self.semantic_mask = torch.from_numpy(semantic_mask).to(self.data_device)
+            else:
+                self.semantic_mask = semantic_mask.to(self.data_device)
+        else:
+            self.semantic_mask = None
+        
+        if depthmap is not None:
+            if isinstance(depthmap, np.ndarray):
+                self.depthmap = torch.from_numpy(depthmap).to(self.data_device)
+            else:
+                self.depthmap = depthmap.to(self.data_device)
+        else:
+            self.depthmap = None
+        
+        if confidence_map is not None:
+            if isinstance(confidence_map, np.ndarray):
+                self.confidence_map = torch.from_numpy(confidence_map).to(self.data_device)
+            else:
+                self.confidence_map = confidence_map.to(self.data_device)
+        else:
+            self.confidence_map = None
+        
+        if normalmap is not None:
+            if isinstance(normalmap, np.ndarray):
+                self.normalmap = torch.from_numpy(normalmap).to(self.data_device)
+            else:
+                self.normalmap = normalmap.to(self.data_device)
+        else:
+            self.normalmap = None
+
+        self.depthloss = depthloss
+
         self.zfar = 100.0
         self.znear = 0.01
 
@@ -58,7 +95,20 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         
+        self.Fx = self.image_width / (2 * math.tan(self.FoVx / 2.))
+        self.Fy = self.image_height / (2 * math.tan(self.FoVy / 2.))
+        self.Cx = float(self.image_width - 1) / 2
+        self.Cy = float(self.image_height - 1) / 2
+
         # self.gt_mask = None
+
+    @property
+    def gray_image(self):
+        return (
+            0.299 * self.original_image[0]  # (H, W)
+            + 0.587 * self.original_image[1]  # (H, W)
+            + 0.114 * self.original_image[2]  # (H, W)
+        ).unsqueeze(0)  # (1, H, W)
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -29,6 +29,7 @@ namespace cg = cooperative_groups;
 #include "auxiliary.h"
 #include "forward.h"
 #include "backward.h"
+#include "apply_weights.h"
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -278,7 +279,7 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	obtain(chunk, img.contrib_scan, img.scan_size, 128);
 
 	obtain(chunk, img.max_contrib, N, 128);
-	obtain(chunk, img.pixel_colors, N * NUM_CHAFFELS, 128);
+	obtain(chunk, img.pixel_colors, N * (NUM_CHAFFELS + MAX_CLASSES), 128);
 	obtain(chunk, img.bucket_count, N, 128);
 	obtain(chunk, img.bucket_offsets, N, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
@@ -291,7 +292,7 @@ CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char *& chunk
 	SampleState sample;
 	obtain(chunk, sample.bucket_to_tile, C * BLOCK_SIZE, 128);
 	obtain(chunk, sample.T, C * BLOCK_SIZE, 128);
-	obtain(chunk, sample.ar, NUM_CHAFFELS * C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.ar, (NUM_CHAFFELS + MAX_CLASSES) * C * BLOCK_SIZE, 128);
 	return sample;
 }
 
@@ -320,11 +321,12 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> sampleBuffer,
 	const int P, int D, int M,
 	const float* background,
-	const int width, int height,
+	const int width, int height, const int num_classes,
 	const float* means3D,
 	const float* dc,
 	const float* shs,
 	const float* colors_precomp,
+	const float* semantic,
 	const float* opacities,
 	const float* scales,
 	const float scale_modifier,
@@ -336,7 +338,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
-
+	float* out_semantic,
 	const bool flag_max_count,
 	float* accum_max_count,
 
@@ -469,9 +471,10 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		binningState.point_list,
 		imgState.bucket_offsets, sampleState.bucket_to_tile,
 		sampleState.T, sampleState.ar,
-		width, height,
+		width, height, num_classes,
 		geomState.means2D,
 		feature_ptr,
+		semantic,
 		flag_max_count,		
 		accum_max_count,		
 		geomState.conic_opacity,
@@ -479,7 +482,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		imgState.n_contrib,
 		imgState.max_contrib,
 		background,
-		out_color), debug)
+		out_color,
+		out_semantic), debug)
 
 	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHAFFELS, cudaMemcpyDeviceToDevice), debug);
 	return std::make_tuple(num_rendered, bucket_sum);
@@ -829,13 +833,14 @@ int CudaRasterizer::Rasterizer::forward_depth(
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
-	const int P, int D, int M, int R, int B,
+	const int P, const int num_classes, int D, int M, int R, int B,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
 	const float* dc,
 	const float* shs,
 	const float* colors_precomp,
+	const float* semantic,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -850,10 +855,12 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	char* sample_buffer,
 	const float* dL_dpix,
+	const float* dL_dpix_semantic,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
+	float* dL_dsemantic,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_ddc,
@@ -887,7 +894,7 @@ void CudaRasterizer::Rasterizer::backward(
 		block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height, R, B,
+		num_classes, width, height, R, B,
 		imgState.bucket_offsets,
 		sampleState.bucket_to_tile,
 		sampleState.T,
@@ -896,15 +903,18 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.means2D,
 		geomState.conic_opacity,
 		color_ptr,
+		semantic,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		imgState.max_contrib,
 		imgState.pixel_colors,
 		dL_dpix,
+		dL_dpix_semantic,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		dL_dsemantic), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -934,4 +944,117 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot), debug)
+}
+
+
+void CudaRasterizer::Rasterizer::apply_weights(
+    std::function<char *(size_t)> geometryBuffer,
+    std::function<char *(size_t)> binningBuffer,
+    std::function<char *(size_t)> imageBuffer, const int P, int D, int M,
+    const float *background, const int width, int height, const float *means3D,
+    const float *shs, float *colors_precomp, const float *opacities,
+    const float *scales, const float scale_modifier, const float *rotations,
+    const float *cov3D_precomp, const float *viewmatrix,
+    const float *projmatrix, const float *cam_pos, const float tan_fovx,
+    float tan_fovy, const bool prefiltered, const float *image_weights,
+    int *radii, float *cnt, const int num_channels, bool debug) {
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char *chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	if (radii == nullptr) {
+		radii = geomState.internal_radii;
+	}
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X,
+					(height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// Dynamically resize image-based auxiliary buffers during training
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char *img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHAFFELS != 3 && colors_precomp == nullptr) {
+		throw std::runtime_error(
+			"For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs
+	// to RGB)
+	CHECK_CUDA(APPLY_WEIGHTS::preprocess(
+		P, D, M, means3D, (glm::vec3 *)scales, scale_modifier,
+		(glm::vec4 *)rotations, opacities, shs, geomState.clamped,
+		cov3D_precomp, colors_precomp, viewmatrix, projmatrix,
+		(glm::vec3 *)cam_pos, width, height, focal_x, focal_y,
+		tan_fovx, tan_fovy, radii, geomState.means2D, geomState.depths,
+		geomState.cov3D, geomState.rgb, geomState.conic_opacity,
+		tile_grid, geomState.tiles_touched, prefiltered),
+	debug)
+
+	// Compute prefix sum over full list of touched tile counts by Gaussians
+	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+		geomState.scanning_space, geomState.scan_size,
+		geomState.tiles_touched, geomState.point_offsets, P),
+	debug)
+
+	// Retrieve total number of Gaussian instances to launch and resize aux
+	// buffers
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1,
+			sizeof(int), cudaMemcpyDeviceToHost),
+	debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char *binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	// For each instance to be rendered, produce adequate [ tile | depth ] key
+	// and corresponding dublicated Gaussian indices to be sorted
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.conic_opacity,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid,
+		geomState.rects2D)
+	CHECK_CUDA(, debug)
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	// Sort complete list of (duplicated) Gaussian indices by keys
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space, binningState.sorting_size,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_keys, binningState.point_list_unsorted,
+		binningState.point_list, num_rendered, 0, 32 + bit),
+	debug)
+
+	CHECK_CUDA(
+	cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)),
+	debug);
+
+	// Identify start and end of per-tile workloads in sorted list
+	if (num_rendered > 0)
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+			num_rendered, binningState.point_list_keys, imgState.ranges);
+	CHECK_CUDA(, debug)
+
+	// Let each tile blend its range of Gaussians independently in parallel
+	float *feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	CHECK_CUDA(APPLY_WEIGHTS::render(
+		tile_grid, block, imgState.ranges, binningState.point_list,
+		width, height, geomState.means2D, feature_ptr,
+		geomState.conic_opacity, imgState.accum_alpha,
+		imgState.n_contrib, background, image_weights, cnt,
+		num_channels),
+	debug);
 }

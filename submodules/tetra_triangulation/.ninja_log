@@ -1,0 +1,4 @@
+# ninja log v7
+2	5133	7988992209723123	CMakeFiles/tetranerf_cpp_extension.dir/src/triangulation.cpp.obj	9dc02a0e15ae5dd7
+5	10819	7988992209758328	CMakeFiles/tetranerf_cpp_extension.dir/src/py_binding.cpp.obj	5322c3a68a80920b
+10845	10976	7988992318160193	tetranerf/utils/extension/tetranerf_cpp_extension.cp39-win_amd64.pyd	8832270a6f33b46a

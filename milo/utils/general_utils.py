@@ -20,11 +20,63 @@ def inverse_sigmoid(x):
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
-    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+    resized_image = torch.from_numpy(np.array(resized_image_PIL)).float() / 255.0
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+
+def NumpyToTorch(numpy_array, resolution):
+    array = torch.from_numpy(numpy_array)
+    # Resize using nearest neighbor
+    array = array.unsqueeze(0).unsqueeze(0).float() # [1, 1, H, W]
+    array = torch.nn.functional.interpolate(array, size=(resolution[1], resolution[0]), mode='nearest')
+    return array.squeeze(0).squeeze(0).to(torch.uint8)
+
+def DepthMapToTorch(numpy_array, resolution):
+    array = torch.from_numpy(numpy_array).float()
+    array = torch.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    # Resize using nearest neighbor to preserve boundaries
+    array = array.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+    array = torch.nn.functional.interpolate(array, size=(resolution[1], resolution[0]), mode='nearest')
+    return array.squeeze(0).squeeze(0) # [H, W] float32
+
+def ConfidenceMapToTorch(numpy_array, resolution):
+    array = torch.from_numpy(numpy_array).float()
+    array = torch.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    # Resize using nearest neighbor
+    array = array.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+    array = torch.nn.functional.interpolate(array, size=(resolution[1], resolution[0]), mode='nearest')
+    return array.squeeze(0).squeeze(0) # [H, W] float32
+
+def NormalMapToTorch(numpy_array, resolution):
+    array = torch.from_numpy(numpy_array).float() # [H, W, 3]
+    array = torch.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    # Map from [0, 255] to [-1.0, 1.0]
+    array = (array / 255.0) * 2.0 - 1.0
+    # Flip Y and Z channels to convert from OpenGL to COLMAP camera space
+    array[..., 1] *= -1.0
+    array[..., 2] *= -1.0
+    # Permute to channel-first [3, H, W] for interpolation
+    array = array.permute(2, 0, 1)
+    # Interpolate using bilinear mode
+    array = array.unsqueeze(0) # [1, 3, H, W]
+    array = torch.nn.functional.interpolate(array, size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)
+    array = array.squeeze(0) # [3, H, W]
+    # Normalize to ensure unit vectors
+    array = torch.nn.functional.normalize(array, dim=0)
+    return array # [3, H, W] float32
+
+def build_scaling_rotation(s, r):
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    R = build_rotation(r)
+
+    L[:,0,0] = s[:,0]
+    L[:,1,1] = s[:,1]
+    L[:,2,2] = s[:,2]
+
+    L = R @ L
+    return L
 
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000

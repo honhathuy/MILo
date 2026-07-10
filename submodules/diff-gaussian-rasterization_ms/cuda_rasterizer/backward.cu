@@ -405,7 +405,7 @@ __global__ void
 PerGaussianRenderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H, int B,
+	int num_classes, int W, int H, int B,
 	const uint32_t* __restrict__ per_tile_bucket_offset,
 	const uint32_t* __restrict__ bucket_to_tile,
 	const float* __restrict__ sampled_T, const float* __restrict__ sampled_ar,
@@ -413,15 +413,18 @@ PerGaussianRenderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ semantic,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ pixel_colors,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_semantic,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dsemantics
 ) {
 	// global_bucket_idx = warp_idx
 	auto block = cg::this_thread_block();
@@ -457,12 +460,15 @@ PerGaussianRenderCUDA(
 	float2 xy = {0.0f, 0.0f};
 	float4 con_o = {0.0f, 0.0f, 0.0f, 0.0f};
 	float c[C] = {0.0f};
+	float sem_feat[MAX_CLASSES] = {0.0f};
 	if (valid_splat) {
 		gaussian_idx = point_list[splat_idx_global];
 		xy = points_xy_image[gaussian_idx];
 		con_o = conic_opacity[gaussian_idx];
 		for (int ch = 0; ch < C; ++ch)
 			c[ch] = colors[gaussian_idx * C + ch];
+		for (int cls = 0; cls < num_classes; ++cls)
+			sem_feat[cls] = semantic[gaussian_idx * num_classes + cls];
 	}
 
 	// Gradient accumulation variables
@@ -473,6 +479,7 @@ PerGaussianRenderCUDA(
 	float Register_dL_dconic2D_w = 0.0f;
 	float Register_dL_dopacity = 0.0f;
 	float Register_dL_dcolors[C] = {0.0f};
+	float Register_dL_dsemantics[MAX_CLASSES] = {0.0f};
 
 	// tile metadata
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -484,7 +491,9 @@ PerGaussianRenderCUDA(
 	float T_final;
 	float last_contributor;
 	float ar[C];
+	float sem_ar[MAX_CLASSES];
 	float dL_dpixel[C];
+	float dL_dpixel_semantic[MAX_CLASSES];
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
@@ -501,6 +510,10 @@ PerGaussianRenderCUDA(
 			ar[ch] = my_warp.shfl_up(ar[ch], 1);
 			dL_dpixel[ch] = my_warp.shfl_up(dL_dpixel[ch], 1);
 		}
+		for (int cls = 0; cls < num_classes; ++cls) {
+			sem_ar[cls] = my_warp.shfl_up(sem_ar[cls], 1);
+			dL_dpixel_semantic[cls] = my_warp.shfl_up(dL_dpixel_semantic[cls], 1);
+		}
 
 		// which pixel index should this thread deal with?
 		int idx = i - my_warp.thread_rank();
@@ -515,10 +528,15 @@ PerGaussianRenderCUDA(
 			T = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
 			T_final = final_Ts[pix_id];
 			for (int ch = 0; ch < C; ++ch)
-				ar[ch] = -(pixel_colors[ch * H * W + pix_id] - T_final * bg_color[ch]) + sampled_ar[global_bucket_idx * BLOCK_SIZE * C + ch * BLOCK_SIZE + idx];
+				ar[ch] = -(pixel_colors[ch * H * W + pix_id] - T_final * bg_color[ch]) + sampled_ar[global_bucket_idx * BLOCK_SIZE * (C + MAX_CLASSES) + ch * BLOCK_SIZE + idx];
+			for (int cls = 0; cls < num_classes; ++cls)
+				sem_ar[cls] = -(pixel_colors[(C + cls) * H * W + pix_id]) + sampled_ar[global_bucket_idx * BLOCK_SIZE * (C + MAX_CLASSES) + (C + cls) * BLOCK_SIZE + idx];
 			last_contributor = n_contrib[pix_id];
 			for (int ch = 0; ch < C; ++ch) {
 				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
+			}
+			for (int cls = 0; cls < num_classes; ++cls) {
+				dL_dpixel_semantic[cls] = dL_dpixels_semantic[cls * H * W + pix_id];
 			}
 		}
 
@@ -547,6 +565,12 @@ PerGaussianRenderCUDA(
 				dL_dalpha += ((c[ch] * T) - (1.0f / (1.0f - alpha)) * (-ar[ch])) * dL_dchannel;
 
 				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
+			}
+			for (int cls = 0; cls < num_classes; ++cls) {
+				sem_ar[cls] += T * alpha * sem_feat[cls];
+				const float &dL_dchannel_sem = dL_dpixel_semantic[cls];
+				Register_dL_dsemantics[cls] += dchannel_dcolor * dL_dchannel_sem;
+				dL_dalpha += ((sem_feat[cls] * T) - (1.0f / (1.0f - alpha)) * (-sem_ar[cls])) * dL_dchannel_sem;
 			}
 			dL_dalpha += (-T_final / (1.0f - alpha)) * bg_dot_dpixel;
 			T *= (1.0f - alpha);
@@ -585,6 +609,9 @@ PerGaussianRenderCUDA(
 		for (int ch = 0; ch < C; ++ch) {
 			atomicAdd(&dL_dcolors[gaussian_idx * C + ch], Register_dL_dcolors[ch]);
 		}
+		for (int cls = 0; cls < num_classes; ++cls) {
+			atomicAdd(&dL_dsemantics[gaussian_idx * num_classes + cls], Register_dL_dsemantics[cls]);
+		}
 	}
 }
 
@@ -599,18 +626,21 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	const int num_classes, int W, int H,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ semantic,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_semantic,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dsemantics)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -628,11 +658,13 @@ renderCUDA(
 
 	bool done = !inside;
 	int toDo = range.y - range.x;
+	if (num_classes > MAX_CLASSES) return;
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_semantic[MAX_CLASSES * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -646,9 +678,15 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
-	if (inside)
+	float accum_semantic_rec[MAX_CLASSES] = { 0 };
+    float dL_dpixel_semantic[MAX_CLASSES] = { 0 };
+    float last_semantic[MAX_CLASSES] = { 0 };
+	if (inside) {
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < num_classes; i++)
+            dL_dpixel_semantic[i] = dL_dpixels_semantic[i * H * W + pix_id];
+	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
@@ -673,6 +711,8 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int i = 0; i < num_classes; i++)
+				collected_semantic[i * BLOCK_SIZE + block.thread_rank()] = semantic[coll_id * num_classes + i];
 		}
 		block.sync();
 
@@ -721,6 +761,22 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			for (int c = 0; c < num_classes; c++)
+            {
+                const float sem = collected_semantic[c * BLOCK_SIZE + j];
+                
+                // Track accumulated semantics from back to front
+                accum_semantic_rec[c] = last_alpha * last_semantic[c] + (1.f - last_alpha) * accum_semantic_rec[c];
+                last_semantic[c] = sem;
+
+                const float dL_dchannel_sem = dL_dpixel_semantic[c];
+                
+                // Propagate gradient into Gaussian's alpha/opacity
+                dL_dalpha += (sem - accum_semantic_rec[c]) * dL_dchannel_sem;
+                
+                // Propagate gradient into the Gaussian's semantic feature logit
+                atomicAdd(&(dL_dsemantics[global_id * num_classes + c]), dchannel_dcolor * dL_dchannel_sem);
+            }
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
@@ -830,7 +886,7 @@ void BACKWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H, int R, int B,
+	const int num_classes, int W, int H, int R, int B,
 	const uint32_t* per_bucket_tile_offset,
 	const uint32_t* bucket_to_tile,
 	const float* sampled_T, const float* sampled_ar,
@@ -838,21 +894,24 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* semantic,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const uint32_t* max_contrib,
 	const float* pixel_colors,
 	const float* dL_dpixels,
+	const float* dL_dpixels_semantic,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_dsemantics)
 {
 	const int THREADS = 32;
 	PerGaussianRenderCUDA<NUM_CHAFFELS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>(
 		ranges,
 		point_list,
-		W, H, B,
+		num_classes, W, H, B,
 		per_bucket_tile_offset,
 		bucket_to_tile,
 		sampled_T, sampled_ar,
@@ -860,32 +919,17 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
+		semantic,
 		final_Ts,
 		n_contrib,
 		max_contrib,
 		pixel_colors,
 		dL_dpixels,
+		dL_dpixels_semantic,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dsemantics
 		);
-
-	// renderCUDA<NUM_CHAFFELS> << <grid, block >> >(
-	// 	ranges,
-	// 	point_list,
-	// 	W, H,
-	// 	bg_color,
-	// 	means2D,
-	// 	conic_opacity,
-	// 	colors,
-	// 	final_Ts,
-	// 	n_contrib,
-	// 	dL_dpixels,
-	// 	dL_dmean2D,
-	// 	dL_dconic2D,
-	// 	dL_dopacity,
-	// 	dL_dcolors
-	// 	);
-
 }

@@ -111,3 +111,29 @@ def L1_loss_appearance(image, gt_image, gaussians, view_idx, return_transformed_
     else:
         transformed_image = torch.nn.functional.interpolate(transformed_image, size=(origH, origW), mode="bilinear", align_corners=True)[0]
         return transformed_image
+
+
+def get_img_grad_weight(img: torch.Tensor) -> torch.Tensor:
+    """
+    Function from PGSR:
+    https://github.com/zju3dv/PGSR/blob/de24f1a38b350387e8d8fe381b2cd70c1ae946e7/utils/loss_utils.py#L92
+    Computes a weight map based on the gradient of the RGB image.
+
+    Args:
+        img (torch.Tensor): The RGB image, with shape (3, H, W).
+
+    Returns:
+        torch.Tensor: The weight map, with shape (H, W).
+    """
+    _, hd, wd = img.shape 
+    bottom_point = img[..., 2:hd,   1:wd-1]
+    top_point    = img[..., 0:hd-2, 1:wd-1]
+    right_point  = img[..., 1:hd-1, 2:wd]
+    left_point   = img[..., 1:hd-1, 0:wd-2]
+    grad_img_x = torch.mean(torch.abs(right_point - left_point), 0, keepdim=True)  # (1, H, W)
+    grad_img_y = torch.mean(torch.abs(top_point - bottom_point), 0, keepdim=True)  # (1, H, W)
+    grad_img = torch.cat((grad_img_x, grad_img_y), dim=0)  # (2, H, W)
+    grad_img, _ = torch.max(grad_img, dim=0)  # (H, W)
+    grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min())  # (H, W)
+    grad_img = torch.nn.functional.pad(grad_img[None,None], (1,1,1,1), mode='constant', value=1.0).squeeze()  # (H, W)
+    return grad_img  # (H, W)

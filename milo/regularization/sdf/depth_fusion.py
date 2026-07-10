@@ -267,6 +267,7 @@ class AdaptiveTSDF:
         depth:torch.Tensor,
         camera:Camera, 
         obs_weight=1.0,
+        mask:torch.Tensor=None,
         override_points:torch.Tensor=None,
         interpolate_depth:bool=True,
         interpolation_mode:str='bilinear',
@@ -347,10 +348,23 @@ class AdaptiveTSDF:
                 packed_values[valid_mask] = torch.cat([depth.unsqueeze(-1), img], dim=-1)[int_pix_y[valid_mask], int_pix_x[valid_mask]]  # (N_valid, 4)
             depth_values = packed_values[..., :1]  # (N, 1)
             img_values = packed_values[..., 1:]  # (N, 3)
-            valid_mask = valid_mask & (depth_values[..., 0] > 0.)  # (N,)
+            # valid_mask = valid_mask & (depth_values[..., 0] > 0.)  # (N,)
+            
+            if mask is not None:
+                mask = mask.squeeze()
+                if mask.dim() == 2:
+                    mask = mask.unsqueeze(-1)
+                mask_values = get_interpolated_value_from_pixel_coordinates(
+                    value_img=mask.to(self.device),
+                    pix_coords=pix_points[valid_mask],
+                    interpolation_mode='nearest',
+                )
+                valid_mask_idx = torch.where(valid_mask)[0]
+                valid_mask[valid_mask_idx] = valid_mask[valid_mask_idx] & (mask_values[..., 0] > 0.5)
             
             # Compute distance
-            sdf = ((depth_values - pix_z.unsqueeze(-1)) / self._trunc_margin).clamp_max(1.)  # (N, 1)
+            depth_for_sdf = torch.where(depth_values > 0., depth_values, pix_z.unsqueeze(-1))
+            sdf = ((depth_for_sdf - pix_z.unsqueeze(-1)) / self._trunc_margin).clamp_max(1.)  # (N, 1)
             # if not self._use_binary_opacity:
             #     valid_mask = valid_mask & (sdf[..., 0] >= -1.)
             valid_mask = valid_mask & (sdf[..., 0] >= -1.)
@@ -447,6 +461,7 @@ def _evaluate_sdf_values(
             depth=render_pkg["depth"],
             camera=view, 
             obs_weight=1.0,
+            mask=masks[cam_id] if masks is not None else None,
             override_points=None,
             interpolate_depth=True,
             interpolation_mode='bilinear',
@@ -548,6 +563,7 @@ def evaluate_mesh_occupancy(
             depth=render_pkg["depth"],
             camera=view, 
             obs_weight=1.0,
+            mask=masks[cam_id] if masks is not None else None,
             override_points=None,
             interpolate_depth=False,
             interpolation_mode='bilinear',

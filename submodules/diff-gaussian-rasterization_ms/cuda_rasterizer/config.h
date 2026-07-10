@@ -15,6 +15,8 @@
 // #define NUM_CHANNELS 3 // Default 3, RGB
 #define NUM_CHAFFELS 3 // Default 3, RGB
 
+#define MAX_CLASSES 8
+
 #define BLOCK_X 16
 #define BLOCK_Y 16
 

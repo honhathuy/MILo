@@ -1,8 +1,23 @@
 from typing import List, Union, Tuple, Optional
 import torch
+import numpy as np
 import nvdiffrast.torch as dr
 from scene.cameras import Camera
 from utils.geometry_utils import transform_points_world_to_view
+
+# Try importing cpp extension, handle potential ImportError
+try:
+    from tetranerf.utils.extension import cpp
+except ImportError:
+    cpp = None
+    print("[WARNING] Could not import 'tetranerf.utils.extension.cpp'. Mesh regularization requires this.")
+
+try:
+    print("[INFO] Importing Delaunay from scipy...")
+    from scipy.spatial import Delaunay
+except ImportError:
+    Delaunay = None
+    print("[WARNING] Could not import 'scipy.spatial.Delaunay'. Mesh regularization requires this.")
 
 
 def nvdiff_rasterization(
@@ -169,7 +184,7 @@ class MeshRasterizer(torch.nn.Module):
         self, 
         cameras:Union[List[Camera], Camera]=None,
         raster_settings:RasterizationSettings=None,
-        use_opengl=True,
+        use_opengl=False,
     ):
         super().__init__()
         
@@ -499,3 +514,16 @@ class ScalableMeshRenderer(torch.nn.Module):
         #### TO REMOVE
 
         return output_pkg
+
+
+def return_delaunay_tets(points: torch.Tensor, method: str) -> torch.Tensor:
+    if method == "tetranerf":
+        with torch.no_grad():
+            return cpp.triangulate(points.detach()).cuda().long()
+    elif method == "scipy":
+        # Slower but easier to install
+        return torch.from_numpy(
+            Delaunay(points.detach().cpu().numpy()).simplices.astype(np.int32)
+        ).to(points.device).long()
+    else:
+        raise ValueError(f"Invalid method: {method}")

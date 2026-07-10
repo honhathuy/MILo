@@ -1,0 +1,20 @@
+            # 1. Align shapes to 4D [B, C, H, W] for F.conv2d and use normalized depth maps
+            depth_4d = depth.view(1, 1, depth.shape[-2], depth.shape[-1])
+            gt_depth_4d = gt_maskeddepth.view(1, 1, gt_maskeddepth.shape[-2], gt_maskeddepth.shape[-1])
+            mask_4d = depth_mask.view(1, 1, depth_mask.shape[-2], depth_mask.shape[-1])
+            conf_4d = confidence_map.view(1, 1, confidence_map.shape[-2], confidence_map.shape[-1])
+
+            # 2. Convolutions using 1D Sobel/derivative kernels
+            kx = torch.tensor([[[[-1, 0, 1]]]], dtype=torch.float32, device=depth_4d.device)
+            ky = torch.tensor([[[[-1], [0], [1]]]], dtype=torch.float32, device=depth_4d.device)
+            grad_x_render = F.conv2d(depth_4d, kx, padding=(0, 1))
+            grad_y_render = F.conv2d(depth_4d, ky, padding=(1, 0))
+            grad_x_mde = F.conv2d(gt_depth_4d, kx, padding=(0, 1))
+            grad_y_mde = F.conv2d(gt_depth_4d, ky, padding=(1, 0))
+
+            # 3. L1 loss on gradients, weighted by the confidence map, valid depth mask, and scale_factor
+            loss_x = (torch.abs(grad_x_render - grad_x_mde) * conf_4d * mask_4d).mean()
+            loss_y = (torch.abs(grad_y_render - grad_y_mde) * conf_4d * mask_4d).mean()
+            depth_grad_loss = (loss_x + loss_y) * scale_factor
+            
+            loss = loss + 0.05 * depth_grad_loss

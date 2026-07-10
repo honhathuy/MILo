@@ -13,7 +13,7 @@ import torch
 from typing import List
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
+from utils.general_utils import PILtoTorch, NumpyToTorch, DepthMapToTorch, ConfidenceMapToTorch, NormalMapToTorch
 from utils.graphics_utils import fov2focal
 
 WARNED = False
@@ -57,10 +57,32 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
+    if cam_info.semantic_mask is not None:
+        semantic_mask = NumpyToTorch(cam_info.semantic_mask, resolution)
+    else:
+        semantic_mask = None
+    
+    if cam_info.depthmap is not None:
+        depthmap = DepthMapToTorch(cam_info.depthmap, resolution)
+    else:
+        depthmap = None
+    
+    if cam_info.confidence_map is not None:
+        confidence_map = ConfidenceMapToTorch(cam_info.confidence_map, resolution)
+    else:
+        confidence_map = None
+    
+    if cam_info.normalmap is not None:
+        normalmap = NormalMapToTorch(cam_info.normalmap, resolution)
+    else:
+        normalmap = None
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  semantic_mask=semantic_mask, depthmap=depthmap, 
+                  confidence_map=confidence_map, normalmap=normalmap, depthloss=cam_info.depthloss)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

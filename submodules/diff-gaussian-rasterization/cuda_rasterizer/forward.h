@@ -61,10 +61,12 @@ namespace FORWARD
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, const int num_clases, const int n_features,
 		const float* view_points,
 		const float2* means2D,
 		const float* colors,
+		const float* semantic,
+		const float* gaussian_features,
 		const float* ts,
 		const float* camera_planes,
 		const float2* ray_planes,
@@ -75,6 +77,8 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
+		float* out_semantic,
+		float* out_gaussian_features,
 		float* out_coord,
 		float* out_mcoord,
 		float* out_normal,
@@ -83,8 +87,10 @@ namespace FORWARD
 		float* accum_coord,
 		float* accum_depth,
 		float* normal_length,
-		bool require_coord,
-		bool require_depth);
+		float* accum_max_count = nullptr,
+		bool flag_max_count = true,
+		bool require_coord = true,
+		bool require_depth = true);
 
 	//follow code is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields
 	// Perform initial steps for each Point prior to integration.
@@ -115,7 +121,7 @@ namespace FORWARD
 		const float2* subpixel_offset,
 		const float2* points2D,
 		const float2* gaussians2D,
-		const float* features,
+		const float* colors,
 		const float* depths_plane,
 		const float2* ray_planes,
 		const float* cov3Ds,

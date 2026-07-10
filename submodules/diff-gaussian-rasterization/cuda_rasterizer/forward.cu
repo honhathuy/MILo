@@ -430,10 +430,12 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, const int num_classes, const int n_features,
 	const float* __restrict__ view_points,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ semantic,
+	const float* __restrict__ gaussian_features,
 	const float* __restrict__ ts,
 	const float* __restrict__ camera_planes,
 	const float2* __restrict__ ray_planes,
@@ -445,6 +447,8 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
+	float* __restrict__ out_semantic,
+	float* __restrict__ out_gaussian_features,
 	float* __restrict__ out_coord,
 	float* __restrict__ out_mcoord,
 	float* __restrict__ out_normal,
@@ -452,7 +456,9 @@ renderCUDA(
 	float* __restrict__ out_mdepth,
 	float* __restrict__ accum_coord,
 	float* __restrict__ accum_depth,
-	float* __restrict__ normal_length
+	float* __restrict__ normal_length,
+	float* __restrict__ accum_max_count,
+	const bool flag_max_count
 	)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -477,6 +483,8 @@ renderCUDA(
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
+	if (num_classes > MAX_CLASSES) return;
+	if (n_features > MAX_FEATURES) return;
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
@@ -488,6 +496,8 @@ renderCUDA(
 	__shared__ float collected_ts[BLOCK_SIZE];
 	__shared__ float2 collected_ray_planes[BLOCK_SIZE];
 	__shared__ float3 collected_normals[BLOCK_SIZE];
+	__shared__ float collected_semantic[BLOCK_SIZE * MAX_CLASSES];
+	__shared__ float collected_gaussian_features[BLOCK_SIZE * MAX_FEATURES];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -503,6 +513,12 @@ renderCUDA(
 	float Normal[3] = {0};
 	float last_depth = 0;
 	float last_weight = 0;
+	float S[MAX_CLASSES] = { 0 };
+	float F[MAX_FEATURES] = { 0 };
+
+	float weight_max = 0;
+	int idx_max = 0;
+	int flag_update = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -538,6 +554,10 @@ renderCUDA(
 			{
 				collected_normals[block.thread_rank()] = normals[coll_id];
 			}
+			for (int c = 0; c < num_classes; c++)
+				collected_semantic[c * BLOCK_SIZE + block.thread_rank()] = semantic[coll_id * num_classes + c];
+			for (int f = 0; f < n_features; f++)
+				collected_gaussian_features[f * BLOCK_SIZE + block.thread_rank()] = gaussian_features[coll_id * n_features + f];
 		}
 		block.sync();
 
@@ -573,9 +593,21 @@ renderCUDA(
 			}
 
 			const float aT = alpha * T;
+			if (flag_max_count && weight_max < aT)
+			{
+				weight_max = aT;
+				idx_max = collected_id[j];
+				flag_update = 1;
+			}
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += collected_feature[j + BLOCK_SIZE * ch] * aT;
+			
+			for (int c = 0; c < num_classes; c++)
+				S[c] += collected_semantic[j + BLOCK_SIZE * c] * aT;
+
+			for (int f = 0; f < n_features; f++)
+				F[f] += collected_gaussian_features[j + BLOCK_SIZE * f] * aT;
 
 			bool before_median = T > 0.5;
 			if constexpr (COORD)
@@ -635,6 +667,12 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_alpha[pix_id] = weight; //1 - T;
+		
+		for (int c = 0; c < num_classes; c++)
+			out_semantic[c * H * W + pix_id] = S[c];
+
+		for (int f = 0; f < n_features; f++)
+			out_gaussian_features[f * H * W + pix_id] = F[f];
 
 		if constexpr (COORD)
 		{
@@ -689,6 +727,10 @@ renderCUDA(
 					out_normal[ch * H * W + pix_id] = 0;
 			}
 		}
+		if (flag_max_count && flag_update == 1 && accum_max_count != nullptr)
+		{
+			atomicAdd(&(accum_max_count[idx_max]),1.0f);
+		}
 	}
 }
 
@@ -697,10 +739,12 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, const int num_classes, const int n_features,
 	const float* view_points,
 	const float2* means2D,
 	const float* colors,
+	const float* semantic,
+	const float* gaussian_features,
 	const float* ts,
 	const float* camera_planes,
 	const float2* ray_planes,
@@ -711,6 +755,8 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
+	float* out_semantic,
+	float* out_gaussian_features,
 	float* out_coord,
 	float* out_mcoord,
 	float* out_normal,
@@ -719,15 +765,17 @@ void FORWARD::render(
 	float* accum_coord,
 	float* accum_depth,
 	float* normal_length,
+	float* accum_max_count,
+	bool flag_max_count,
 	bool require_coord,
 	bool require_depth)
 {
 #define RENDER_CUDA_CALL(template_coord, template_depth, template_normal) \
 renderCUDA<NUM_CHANNELS, template_coord, template_depth, template_normal> <<<grid, block>>> ( \
-	ranges, point_list, W, H, view_points, means2D, colors, ts, camera_planes, ray_planes, \
-	normals, conic_opacity, focal_x, focal_y, out_alpha, n_contrib, bg_color, out_color, \
+	ranges, point_list, W, H, num_classes, n_features, view_points, means2D, colors, semantic, gaussian_features, ts, camera_planes, ray_planes, \
+	normals, conic_opacity, focal_x, focal_y, out_alpha, n_contrib, bg_color, out_color, out_semantic, out_gaussian_features, \
 	out_coord, out_mcoord, out_normal, out_depth, out_mdepth, \
-	accum_coord, accum_depth, normal_length)
+	accum_coord, accum_depth, normal_length, accum_max_count, flag_max_count)
 
 	if (require_coord && require_depth)
 		RENDER_CUDA_CALL(true, true, true);

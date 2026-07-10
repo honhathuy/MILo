@@ -57,6 +57,9 @@ class ModelParams(ParamGroup):
         # self.use_decoupled_appearance = False
         self.llff = 8
         self.kernel_size = 0.0  # Added
+        self.num_classes = 0
+        self.no_depth_prior = False
+        self.disable_confidence = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -93,7 +96,17 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.appearance_embeddings_lr = 0.001
         self.appearance_network_lr = 0.001
+        self.lambda_semantic = 0.005
         super().__init__(parser, "Optimization Parameters")
+
+
+class GraphCutParams(ParamGroup):
+    def __init__(self, parser):
+        self.num_edges = 5
+        self.terminal_clusters_source = 5
+        self.terminal_clusters_sink = 5
+        self.leaf_size = 40 # default value from library
+
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

@@ -173,12 +173,13 @@ def log_training_progress(
     # Configs
     mesh_config:Dict[str, Any],
     # EMA losses for logging
-    postfix_dict:Dict[str, Any], ema_loss_for_log:float, ema_depth_normal_loss_for_log:float,
+    postfix_dict:Dict[str, Any], ema_loss_for_log:float, ema_semantic_loss_for_log:float, ema_depth_normal_loss_for_log:float,
     ema_mesh_depth_loss_for_log:float, ema_mesh_normal_loss_for_log:float,
     ema_occupied_centers_loss_for_log:float, ema_occupancy_labels_loss_for_log:float,
     ema_depth_order_loss_for_log:float,
     # Additional arguments
-    testing_iterations:List[int], saving_iterations:List[int], render_imp,
+    testing_iterations:List[int], saving_iterations:List[int], render_imp, semantic_loss:torch.Tensor=None,
+    monosdf_loss:torch.Tensor=None, scale_factor=None,
 ):
     WANDB_FOUND = run is not None
     
@@ -195,22 +196,58 @@ def log_training_progress(
             ema_occupancy_labels_loss_for_log = 0.4 * occupancy_labels_loss.item() + 0.6 * ema_occupancy_labels_loss_for_log
     if depth_order_kick_on:
         ema_depth_order_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_order_loss_for_log
+
+    # Update raw float values in postfix_dict for logging (e.g. to WandB)
+    postfix_dict["Loss"] = ema_loss_for_log
+    if reg_kick_on:
+        postfix_dict["DNLoss"] = ema_depth_normal_loss_for_log
+    else:
+        postfix_dict.pop("DNLoss", None)
+        
+    if depth_order_kick_on:
+        postfix_dict["DOLoss"] = ema_depth_order_loss_for_log
+    else:
+        postfix_dict.pop("DOLoss", None)
+        
+    if monosdf_loss is not None:
+        ema_ms = postfix_dict.get("MSNLoss", 0.0)
+        ema_ms = 0.4 * monosdf_loss.item() + 0.6 * ema_ms
+        postfix_dict["MSNLoss"] = ema_ms
+    else:
+        postfix_dict.pop("MSNLoss", None)
+        
+    if scale_factor is not None:
+        val = scale_factor.item() if isinstance(scale_factor, torch.Tensor) else scale_factor
+        ema_sf = postfix_dict.get("ScaleFac", 0.0)
+        ema_sf = 0.4 * val + 0.6 * ema_sf
+        postfix_dict["ScaleFac"] = ema_sf
+    else:
+        postfix_dict.pop("ScaleFac", None)
+        
+    if mesh_kick_on:
+        postfix_dict["MDLoss"] = ema_mesh_depth_loss_for_log
+        postfix_dict["MNLoss"] = ema_mesh_normal_loss_for_log
+        if mesh_config and mesh_config.get("enforce_occupied_centers", False):
+            postfix_dict["OccLoss"] = ema_occupied_centers_loss_for_log
+        else:
+            postfix_dict.pop("OccLoss", None)
+        if mesh_config and mesh_config.get("use_occupancy_labels_loss", False):
+            postfix_dict["OccLabLoss"] = ema_occupancy_labels_loss_for_log
+        else:
+            postfix_dict.pop("OccLabLoss", None)
+    else:
+        postfix_dict.pop("MDLoss", None)
+        postfix_dict.pop("MNLoss", None)
+        postfix_dict.pop("OccLoss", None)
+        postfix_dict.pop("OccLabLoss", None)
     
     if iteration % 10 == 0:
-        postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}"}
-        if reg_kick_on:
-            postfix_dict["DNLoss"] = f"{ema_depth_normal_loss_for_log:.{7}f}"
-        if depth_order_kick_on:
-            postfix_dict["DOLoss"] = f"{ema_depth_order_loss_for_log:.{7}f}"
-        if mesh_kick_on:
-            postfix_dict["MDLoss"] = f"{ema_mesh_depth_loss_for_log:.{7}f}"
-            postfix_dict["MNLoss"] = f"{ema_mesh_normal_loss_for_log:.{7}f}"
-            if mesh_config["enforce_occupied_centers"]:
-                postfix_dict["OccLoss"] = f"{ema_occupied_centers_loss_for_log:.{7}f}"
-            if mesh_config["use_occupancy_labels_loss"]:
-                postfix_dict["OccLabLoss"] = f"{ema_occupancy_labels_loss_for_log:.{7}f}"
-        postfix_dict["N_Gauss"] = f"{gaussians._xyz.shape[0]}"
-        progress_bar.set_postfix(postfix_dict)
+        postfix_dict_display = {}
+        for key in ["Loss", "DNLoss", "DOLoss", "MSNLoss", "ScaleFac", "MDLoss", "MNLoss", "OccLoss", "OccLabLoss"]:
+            if key in postfix_dict:
+                postfix_dict_display[key] = f"{postfix_dict[key]:.{7}f}"
+        postfix_dict_display["N_Gauss"] = f"{gaussians._xyz.shape[0]}"
+        progress_bar.set_postfix(postfix_dict_display)
         progress_bar.update(10)
         
     if iteration == opt.iterations:
@@ -243,6 +280,13 @@ def log_training_progress(
             images_to_log.append((1. - render_pkg["normal"]) / 2.)
             titles_to_log.append(f"Rendered Normals {viewpoint_idx}")
             
+        if "semantic" in render_pkg and render_pkg["semantic"].shape[0] > 0:
+            images_to_log.append(render_pkg["semantic"].argmax(dim=0).float())
+            titles_to_log.append(f"Rendered Semantic {viewpoint_idx}")
+            if viewpoint_cam.semantic_mask is not None:
+                images_to_log.append(viewpoint_cam.semantic_mask.cuda().float())
+                titles_to_log.append(f"GT Semantic {viewpoint_idx}")
+            
         if mesh_kick_on:
             images_to_log.append(torch.zeros_like(render_pkg["render"]))
             titles_to_log.append(f"Mesh RGB {viewpoint_idx}")
@@ -264,6 +308,24 @@ def log_training_progress(
             )
             titles_to_log.append(f"Mesh Normals {viewpoint_idx}")
         
+        # Define visualization directory
+        viz_dir = os.path.join(args.model_path, "visualizations", f"iter_{iteration}")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        # Save combined figure for quick overview
+        make_log_figure(
+            images=images_to_log, 
+            titles=titles_to_log, 
+            cmap='Spectral',
+            ncols=3,
+            figsize=30,
+            show_plot=False,
+            save_plot=True,
+            save_path=os.path.join(viz_dir, "overview.png"),
+            return_log_images=False,
+        )
+
+        # Save individual high-quality images for detailed inspection
         log_images_dict = make_log_figure(
             images=images_to_log, 
             titles=titles_to_log, 
@@ -271,10 +333,27 @@ def log_training_progress(
             ncols=3,
             figsize=30,
             show_plot=False,
-            save_plot=not WANDB_FOUND,
-            save_path=os.path.join(args.model_path, f"iter_{iteration}.png"),
-            return_log_images=WANDB_FOUND,
+            save_plot=False,
+            return_log_images=True,
         )
+        
+        for title, img in log_images_dict.items():
+            img_to_save = img.clone().detach().nan_to_num(0)
+            img_path = os.path.join(viz_dir, f"{title.lower().replace(' ', '_')}.png")
+            
+            if "semantic" in title.lower():
+                # Map to discrete colors using tab20
+                max_c = gaussians.num_classes - 1 if gaussians.num_classes > 1 else 1
+                normalized_img = (img_to_save.squeeze() / max_c).clamp(0, 1)
+                plt.imsave(img_path, plt.get_cmap('tab20')(normalized_img.cpu().numpy()))
+            elif "depth" in title.lower():
+                # Map to Spectral colormap
+                v_min, v_max = img_to_save.min(), img_to_save.max()
+                normalized_img = ((img_to_save.squeeze() - v_min) / (v_max - v_min + 1e-5)).clamp(0, 1)
+                plt.imsave(img_path, plt.get_cmap('Spectral')(normalized_img.cpu().numpy()))
+            else:
+                # RGB or Normals (already H,W,C from make_log_figure)
+                plt.imsave(img_path, img_to_save.squeeze().clamp(0, 1).cpu().numpy())
         
         if WANDB_FOUND:
             # Log metrics
@@ -315,6 +394,7 @@ def log_training_progress(
     return (
         postfix_dict,
         ema_loss_for_log, 
+        ema_semantic_loss_for_log,
         ema_depth_normal_loss_for_log, 
         ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
         ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 

@@ -1,17 +1,17 @@
 # Regularization schedule
 start_iter: 8_001
-mesh_update_interval: 1 
+mesh_update_interval: 5 
 stop_iter: 18000
 
 # Depth loss weight
 use_depth_loss: true
-depth_weight: 0.05  # 0.05
+depth_weight: 0.2  # 0.05
 depth_ratio: 1.0  # 0.6 
 mesh_depth_loss_type: "log"  # "log"
 
 # Normal loss weight
 use_normal_loss: true  # true
-normal_weight: 0.05  # 0.05
+normal_weight: 0.2  # 0.05
 use_depth_normal: true  # true
 
 # Delaunay computation

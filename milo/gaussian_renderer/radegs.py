@@ -17,7 +17,7 @@ from utils.sh_utils import eval_sh
 
 # Following functions are adopted from RaDe-GS: https://github.com/BaowenZ/RaDe-GS/blob/main/gaussian_renderer/__init__.py
 
-def render_radegs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size=0.0, scaling_modifier = 1.0, require_coord : bool = False, require_depth : bool = True):
+def render_radegs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size=0.0, scaling_modifier = 1.0, require_coord : bool = False, require_depth : bool = True, flag_max_count : bool = True, render_normal_field : bool = False):
     """
     Render the scene. 
     
@@ -73,7 +73,12 @@ def render_radegs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     shs = pc.get_features
     colors_precomp = None
 
-    rendered_image, radii, rendered_expected_coord, rendered_median_coord, rendered_expected_depth, rendered_median_depth, rendered_alpha, rendered_normal = rasterizer(
+    gaussian_normals = None
+    if render_normal_field:
+        gaussian_normals = pc.convert_features_to_normals(normalize=True)
+        gaussian_normals = torch.nn.functional.normalize(gaussian_normals, dim=-1)
+
+    rendered_image, out_semantic, out_normal_field, radii, accum_max_count, rendered_expected_coord, rendered_median_coord, rendered_expected_depth, rendered_median_depth, rendered_alpha, rendered_normal = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -81,13 +86,16 @@ def render_radegs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
-
-
+        cov3D_precomp = cov3D_precomp,
+        semantic = pc._semantic,
+        gaussian_features = gaussian_normals,
+        flag_max_count = flag_max_count)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
+            "semantic": out_semantic,
+            "normal_field": out_normal_field if render_normal_field else None,
             "mask": rendered_alpha,
             "expected_coord": rendered_expected_coord,
             "median_coord": rendered_median_coord,
@@ -97,6 +105,7 @@ def render_radegs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
             "visibility_filter" : radii > 0,
             "radii": radii,
             "normal":rendered_normal,
+            "area_max": accum_max_count,
             }
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py

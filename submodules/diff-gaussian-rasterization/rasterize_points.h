@@ -15,11 +15,13 @@
 #include <tuple>
 #include <string>
 	
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
+	const torch::Tensor& semantic,
+	const torch::Tensor& gaussian_features,
     const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
@@ -38,14 +40,17 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool geo_reg,
 	const bool require_depth,
+	const bool flag_max_count,
 	const bool debug);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
+	const torch::Tensor& semantic,
+	const torch::Tensor& gaussian_features,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -56,6 +61,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovy,
 	const float kernel_size,
     const torch::Tensor& dL_dout_color,
+	const torch::Tensor& dL_dout_semantic,
+	const torch::Tensor& dL_dout_gaussian_features,
 	const torch::Tensor& dL_dout_coord,
 	const torch::Tensor& dL_dout_mcoord,
 	const torch::Tensor& dL_dout_depth,
@@ -70,7 +77,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& alpha,
+	const torch::Tensor& alphas,
 	const bool require_coord,
 	const bool require_depth,
 	const bool debug);

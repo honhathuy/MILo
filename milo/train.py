@@ -11,6 +11,7 @@ sys.path.append(SUBMODULES_DIR)
 sys.path.append(os.path.join(SUBMODULES_DIR, 'Depth-Anything-V2'))
 
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, L1_loss_appearance
 from fused_ssim import fused_ssim
@@ -19,7 +20,7 @@ from gaussian_renderer import network_gui
 from gaussian_renderer import render_imp, render_simp, render_depth, render_full
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, build_rotation
 import uuid
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
@@ -33,7 +34,7 @@ except ImportError:
 import numpy as np
 import time
 
-from utils.geometry_utils import depth_to_normal
+from utils.geometry_utils import depth_to_normal, det3x3, inverse3x3, normalize_depth, cos_weight, monosdf_normal_loss
 from utils.log_utils import log_training_progress
 from regularization.regularizer.depth_order import (
     initialize_depth_order_supervision,
@@ -43,6 +44,9 @@ from regularization.regularizer.mesh import (
     initialize_mesh_regularization,
     compute_mesh_regularization,
     reset_mesh_state_at_next_iteration,
+)
+from regularization.regularizer.normal_field import (
+    initialize_normal_field,
 )
 
 def training(
@@ -59,12 +63,21 @@ def training(
     # ---Initialize scene and Gaussians---
     first_iter = 0
     use_mip_filter = not args.disable_mip_filter
+
+    n_gaussian_features = 0
+    if args.use_normal_field:
+        n_gaussian_features = 4
+
     gaussians = GaussianModel(
         sh_degree=0, 
+        num_classes=args.num_classes,
         use_mip_filter=use_mip_filter, 
         learn_occupancy=args.mesh_regularization,
         use_appearance_network=args.decoupled_appearance,
+        n_gaussian_features=n_gaussian_features,
     )
+    if getattr(dataset, "no_depth_prior", False) and args.depth_order:
+        raise ValueError("Cannot use --depth_order when --no_depth_prior is specified. Please disable depth order prior regularization if you wish to disable loading depth/normal maps.")
     scene = Scene(dataset, gaussians, resolution_scales=[1,2])
     gaussians.training_setup(opt)
     print(f"[INFO] Using 3D Mip Filter: {gaussians.use_mip_filter}")
@@ -95,6 +108,7 @@ def training(
     viewpoint_stack = None
     postfix_dict = {}
     ema_loss_for_log = 0.0
+    ema_semantic_loss_for_log = 0.0
     ema_depth_normal_loss_for_log = 0.0
     
     # ---Prepare Mesh-In-the-Loop Regularization---
@@ -104,20 +118,27 @@ def training(
             scene=scene,
             config=mesh_config,
         )
+    
+    if args.use_normal_field:
+        print("[INFO] Using Normal Field.")
+        normal_field_state = initialize_normal_field(
+            scene=scene,
+        )
+
     ema_mesh_depth_loss_for_log = 0.0
     ema_mesh_normal_loss_for_log = 0.0
     ema_occupied_centers_loss_for_log = 0.0
     ema_occupancy_labels_loss_for_log = 0.0
     
     # ---Prepare Depth-Order Regularization---    
-    if args.depth_order:
-        print("[INFO] Using depth order regularization.")
-        print(f"        > Using expected depth with depth_ratio {depth_order_config['depth_ratio']} for depth order regularization.")
-        depth_priors = initialize_depth_order_supervision(
-            scene=scene,
-            config=depth_order_config,
-            device='cuda',
-        )
+    # if args.depth_order:
+    #     print("[INFO] Using depth order regularization.")
+    #     print(f"        > Using expected depth with depth_ratio {depth_order_config['depth_ratio']} for depth order regularization.")
+    #    depth_priors = initialize_depth_order_supervision(
+    #         scene=scene,
+    #         config=depth_order_config,
+    #         device='cuda',
+    #     )
     ema_depth_order_loss_for_log = 0.0
         
     # ---Log optimizable param groups---
@@ -141,23 +162,7 @@ def training(
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    for iteration in range(first_iter, opt.iterations + 1):   
-
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render_imp(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
+    for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
         gaussians.update_learning_rate(iteration)
 
@@ -179,15 +184,27 @@ def training(
             pipe.debug = True
             
         reg_kick_on = iteration >= args.regularization_from_iter
-        mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"])
+        mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"]) and (
+            iteration == mesh_config["start_iter"] or iteration % mesh_config.get("mesh_update_interval", 1) == 0
+        )
         depth_order_kick_on = args.depth_order
+        normal_field_kick_on = args.use_normal_field and (iteration >= 8000)
         
-        # If depth-normal regularization or mesh-in-the-loop regularization are active,
-        # we use the rasterizer compatible with depth and normal rendering.
-        if reg_kick_on or mesh_kick_on:
+        if normal_field_kick_on:
             render_pkg = render(
                 viewpoint_cam, gaussians, pipe, background,
                 require_coord=False, require_depth=True,
+                flag_max_count=False,
+                render_normal_field=True
+            )
+
+        # If depth-normal regularization or mesh-in-the-loop regularization are active,
+        # we use the rasterizer compatible with depth and normal rendering.
+        elif reg_kick_on or mesh_kick_on:
+            render_pkg = render(
+                viewpoint_cam, gaussians, pipe, background,
+                require_coord=False, require_depth=True,
+                flag_max_count=False,
             )
             
         # Else, if depth-order regularization is active, we use Mini-Splatting2 rasterizer 
@@ -209,6 +226,9 @@ def training(
             )
 
         # ---Compute losses---
+        semantic_loss = None
+        monosdf_loss = None
+        scale_factor = None
         image, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"], render_pkg["viewspace_points"], 
             render_pkg["visibility_filter"], render_pkg["radii"]
@@ -223,13 +243,100 @@ def training(
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
-        # Depth-Normal Consistency Regularization
-        if reg_kick_on:
-            rendered_depth_to_normals: torch.Tensor = depth_to_normal(
+        # # Semantic loss
+        # if "semantic" in render_pkg and gt_semantic_mask is not None and gaussians.num_classes > 0:
+        #     semantic_loss = torch.nn.functional.cross_entropy(render_pkg["semantic"].unsqueeze(0), gt_semantic_mask.unsqueeze(0))
+        #     loss = loss + opt.lambda_semantic * semantic_loss
+
+        #     visible = radii > 0
+
+        #     # penalize gaussians with low confident semantic
+        #     probs_3d = gaussians.get_semantic[visible]
+        #     entropy_3d = -torch.sum(probs_3d * torch.log(probs_3d + 1e-8), dim=-1)
+        #     pointwise_entropy_loss = entropy_3d.mean()
+        #     loss = loss + 0.01 * pointwise_entropy_loss
+            
+        #     # Opacity entropy: penalizes alpha values around 0.5, rewards 0.0 and 1.0
+        #     # alpha = gaussians.get_opacity[visible]
+        #     # opacity_entropy_loss = - (alpha * torch.log(alpha + 1e-8) + (1 - alpha) * torch.log(1 - alpha + 1e-8)).mean()
+        #     # loss = loss + 0.01 * opacity_entropy_loss
+
+        #     if iteration % 300 == 0:
+        #         xyz = gaussians.get_xyz
+        #         scales = gaussians.get_scaling
+        #         rots = gaussians.get_rotation
+        #         opacities = gaussians.get_opacity
+        #         semantics = gaussians.get_semantic
+        #         with torch.no_grad():
+        #             edge_index = radius_graph(xyz, r=0.05, max_num_neighbors=16, loop=False)
+        #             idx_neighbor = edge_index[0] # Source nodes
+        #             idx_center = edge_index[1] # Target nodes
+
+        #             # Build Covariance Matrices
+        #             R = build_rotation(rots)                
+        #             S = torch.diag_embed(scales)            
+        #             L = R @ S
+        #             Sigma = L @ L.transpose(-1, -2)        
+
+        #             # Gather data ONLY for the valid edges [E, ...]
+        #             center_xyz = xyz[idx_center]
+        #             neighbor_xyz = xyz[idx_neighbor]
+                    
+        #             center_Sigma = Sigma[idx_center]
+        #             neighbor_Sigma = Sigma[idx_neighbor]
+                    
+        #             center_opacity = opacities[idx_center].squeeze(-1)
+        #             neighbor_opacity = opacities[idx_neighbor].squeeze(-1)
+
+        #             # Compute Summed Covariance for each edge [E, 3, 3]
+        #             Sigma_sum = center_Sigma + neighbor_Sigma               
+
+        #             # Invert and get determinant using optimized 3x3 functions
+        #             Sigma_sum_inv = inverse3x3(Sigma_sum)             
+        #             Sigma_sum_det = det3x3(Sigma_sum)             
+
+        #             # Intersection Math
+        #             diff = (center_xyz - neighbor_xyz).unsqueeze(-1) # [E, 3, 1]
+                    
+        #             mahalanobis_dist = diff.transpose(-2, -1) @ Sigma_sum_inv @ diff # [E, 1, 1]
+        #             mahalanobis_dist = mahalanobis_dist.squeeze(-1).squeeze(-1) # [E]
+
+        #             volume_factor = 1.0 / torch.sqrt(torch.clamp(Sigma_sum_det, min=1e-8))
+
+        #             # Calculate absolute overlap weight per edge [E]
+        #             overlap_weights = center_opacity * neighbor_opacity * volume_factor * torch.exp(-0.5 * mahalanobis_dist)
+                
+        #         center_semantics = semantics[idx_center]     # [E, num_classes]
+        #         neighbor_semantics = semantics[idx_neighbor] # [E, num_classes]
+        #         raw_mse = torch.nn.functional.mse_loss(center_semantics, neighbor_semantics, reduction='none')
+        #         raw_mse = raw_mse.mean(dim=-1)
+        #         semantic_knn_loss = (overlap_weights * raw_mse).sum() / xyz.shape[0]
+        #         loss = loss + 0.01 * semantic_knn_loss
+
+        #         if iteration % 300 == 0:
+        #             with torch.no_grad():
+        #                 num_pts = xyz.shape[0]
+        #                 num_edges = edge_index.shape[1]
+        #                 neighbor_counts = torch.bincount(edge_index[1], minlength=num_pts)
+        #                 num_zero_neighbors = (neighbor_counts == 0).sum().item()
+        #                 avg_neighbors = num_edges / num_pts
+        #                 print(f"\n[Iteration {iteration}] Semantic KNN Stats: Avg Neighbors: {avg_neighbors:.2f}, Points with 0 Neighbors: {num_zero_neighbors}/{num_pts} ({num_zero_neighbors/num_pts*100:.1f}%)")
+        
+        # Depth-Normal Consistency & MonoSDF Normal Regularization
+        depth_normal_loss = None
+        monosdf_loss = None
+        rendered_depth_to_normals = None
+        
+        monosdf_active = depth_order_kick_on and iteration <= 8000
+        
+        if reg_kick_on or monosdf_active:
+            rendered_depth_to_normals = depth_to_normal(
                 viewpoint_cam, 
                 render_pkg["median_depth"],  # 1, H, W
                 render_pkg["expected_depth"],  # 1, H, W
             )  # 3, H, W or 2, 3, H, W
+            
+        if reg_kick_on:
             rendered_normals: torch.Tensor = render_pkg["normal"]  # 3, H, W
             
             if rendered_depth_to_normals.ndim == 4:
@@ -245,11 +352,31 @@ def training(
                 depth_normal_loss = args.lambda_depth_normal * (1 - (rendered_normals * rendered_depth_to_normals).sum(dim=0)).mean()
             
             loss = loss + depth_normal_loss
+
+        if monosdf_active:
+            prior_normal = viewpoint_cam.normalmap.cuda()
+            if rendered_depth_to_normals.ndim == 4:
+                # Weight median and expected depth normals using reg_depth_ratio (or 0.6) to match the self-consistency combination
+                reg_depth_ratio = 0.6
+                rendered_depth_to_normals_cl = (
+                    (1. - reg_depth_ratio) * rendered_depth_to_normals[0]
+                    + reg_depth_ratio * rendered_depth_to_normals[1]
+                ).permute(1, 2, 0)
+            else:
+                rendered_depth_to_normals_cl = rendered_depth_to_normals.permute(1, 2, 0)
+                
+            prior_normal_cl = prior_normal.permute(1, 2, 0)
+            normal_confidence = cos_weight(rendered_depth_to_normals_cl, prior_normal_cl)
+            monosdf_loss = monosdf_normal_loss(rendered_depth_to_normals_cl, prior_normal_cl, normal_confidence)
+            loss = loss + 0.05 * monosdf_loss
             
         # Depth Order Regularization
         # > This loss relies on Depth-AnythingV2, and is not used in MILo paper.
         # > In the paper, MILo does not rely on any learned prior. 
-        if depth_order_kick_on:
+        depthloss_align = viewpoint_cam.depthloss
+        do_supervision_depth = None
+        depth_prior_loss = None
+        if depth_order_kick_on and iteration <= 8000:
             if depth_order_config["depth_ratio"] < 1.:
                 depth_for_depth_order = (
                     (1. - depth_order_config["depth_ratio"]) * render_pkg["expected_depth"]
@@ -258,18 +385,23 @@ def training(
             else:
                 depth_for_depth_order = render_pkg["median_depth"]
                 
-            depth_prior_loss, _, do_supervision_depth, lambda_depth_order = compute_depth_order_regularization(
-                iteration=iteration,
-                rendered_depth=depth_for_depth_order,
-                depth_priors=depth_priors,
-                viewpoint_idx=viewpoint_idx,
-                gaussians=gaussians,
-                config=depth_order_config,
-            )
-                
+            depth_mask = (viewpoint_cam.depthmap>0).cuda()
+            gt_maskeddepth = (viewpoint_cam.depthmap.cuda() * depth_mask)
+
+            gt_maskeddepth = normalize_depth(gt_maskeddepth)
+            depth = normalize_depth(depth_for_depth_order)
+
+            depthloss_align_tensor = torch.tensor(depthloss_align).cuda()
+            scale_factor = 0.6 * torch.exp(-1 * depthloss_align_tensor)
+            pixelwise_l1_loss = torch.abs(gt_maskeddepth - depth * depth_mask)
+            # if viewpoint_cam.confidence_map is not None:
+            #     confidence_map = viewpoint_cam.confidence_map.cuda().float()
+            # else:
+            #     confidence_map = torch.ones_like(gt_maskeddepth)
+            weighted_loss = pixelwise_l1_loss #* confidence_map
+            depth_prior_loss = weighted_loss.mean() * scale_factor
             loss = loss + depth_prior_loss
-            depth_order_kick_on = lambda_depth_order > 0
-        
+
         # Mesh-In-the-Loop Regularization
         if mesh_kick_on:
             if args.detach_gaussian_rendering:
@@ -307,6 +439,7 @@ def training(
             mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
             
             loss = loss + mesh_loss
+            # torch.cuda.empty_cache()
         
         # ---Backward pass---
         loss.backward()
@@ -314,11 +447,12 @@ def training(
         iter_end.record()
 
         with torch.no_grad():
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if semantic_loss is not None:
+                ema_semantic_loss_for_log = 0.4 * semantic_loss.item() + 0.6 * ema_semantic_loss_for_log
             # ---Logging---
             (
-                postfix_dict,
-                ema_loss_for_log, 
-                ema_depth_normal_loss_for_log, 
+                postfix_dict, ema_loss_for_log, ema_semantic_loss_for_log, ema_depth_normal_loss_for_log, 
                 ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
                 ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
                 ema_depth_order_loss_for_log
@@ -327,16 +461,18 @@ def training(
                 scene, gaussians, pipe, opt, background,
                 viewpoint_idx, viewpoint_cam, render_pkg, 
                 mesh_render_pkg if mesh_kick_on else None, 
-                do_supervision_depth if depth_order_kick_on else None,
-                reg_kick_on, mesh_kick_on, depth_order_kick_on,
+                do_supervision_depth if (depth_order_kick_on and iteration <= 3000) else None,
+                reg_kick_on, mesh_kick_on, depth_order_kick_on and iteration <= 3000,
                 loss, depth_normal_loss if reg_kick_on else None, 
                 mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
                 occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
-                depth_prior_loss if depth_order_kick_on else None,
+                depth_prior_loss if (depth_order_kick_on and iteration <= 8000) else None,
                 mesh_config if mesh_kick_on else None, 
-                postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
-                ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
-                ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp,
+                postfix_dict, ema_loss_for_log, ema_semantic_loss_for_log, ema_depth_normal_loss_for_log, 
+                ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+                ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp, semantic_loss,
+                monosdf_loss=monosdf_loss if (depth_order_kick_on and iteration <= 8000) else None,
+                scale_factor=scale_factor if (depth_order_kick_on and iteration <= 3000) else None,
             )
 
             # ---Densification---
@@ -446,7 +582,7 @@ def training(
                 gaussians.init_culling(len(scene.getTrainCameras()))
 
             # ---Reset mesh state if Gaussians have changed---
-            if mesh_kick_on and gaussians_have_changed:
+            if args.mesh_regularization and gaussians_have_changed:
                 mesh_state = reset_mesh_state_at_next_iteration(mesh_state)
                 
             # ---Update 3D Mip Filter---

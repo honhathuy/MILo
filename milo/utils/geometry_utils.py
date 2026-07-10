@@ -1,6 +1,7 @@
 import math
 import torch
-from typing import List
+import numpy as np
+from typing import List, Optional
 from utils.general_utils import build_rotation
 from scene.cameras import Camera
 from tqdm import tqdm
@@ -174,6 +175,80 @@ def depth_to_normal(view, depth1, depth2=None):
     return point_to_normal(view, *points)
 
 
+def depth_to_normal_with_mask(view, depth:torch.Tensor):
+    W, H = view.image_width, view.image_height
+    Fx = W / (2 * math.tan(view.FoVx / 2.))
+    Fy = H / (2 * math.tan(view.FoVy / 2.))
+    Cx = W / 2.0
+    Cy = H / 2.0
+    x = (torch.arange(W, device="cuda", dtype=torch.float32) - Cx) / Fx
+    y = (torch.arange(H, device="cuda", dtype=torch.float32) - Cy) / Fy
+    points = torch.cat([depth * x[None, None], depth * y[None, :, None], depth], dim=0)
+    dy = points[:, 2:, 1:-1] - points[:, :-2, 1:-1]
+    dx = points[:, 1:-1, 2:] - points[:, 1:-1, :-2]
+    normal_map = torch.nn.functional.normalize(torch.cross(dy, dx, dim=0), dim=0)
+    output = torch.nn.functional.pad(normal_map, (1, 1, 1, 1))
+
+    valid_depths = depth > 0
+    valid_depths = (
+        valid_depths[:, 2:, 1:-1] & valid_depths[:, :-2, 1:-1] & valid_depths[:, 1:-1, 2:] & valid_depths[:, 1:-1, :-2] & valid_depths[:, 1:-1, 1:-1]
+    )
+    valid_points = torch.zeros_like(depth, dtype=torch.bool)
+    valid_points[:, 1:-1, 1:-1] = valid_depths
+    return output, valid_points
+
+
+def normalize_depth(depth):
+    # Support both PyTorch tensor and NumPy array
+    if isinstance(depth, torch.Tensor):
+        # Filter out inf and nan for min/max calculation
+        clean_depth = depth[torch.isfinite(depth)]
+        if clean_depth.numel() == 0:
+            return torch.zeros_like(depth)
+        d_min = clean_depth.min()
+        d_max = clean_depth.max()
+        denom = d_max - d_min
+        if denom < 1e-8:
+            return torch.zeros_like(depth)
+        # Also clean depth itself just in case
+        depth_clean = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        return (depth_clean - d_min) / denom
+    else:
+        clean_depth = depth[np.isfinite(depth)]
+        if clean_depth.size == 0:
+            return np.zeros_like(depth)
+        d_min = clean_depth.min()
+        d_max = clean_depth.max()
+        denom = d_max - d_min
+        if denom < 1e-8:
+            return np.zeros_like(depth)
+        depth_clean = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        return (depth_clean - d_min) / denom
+
+
+def cos_weight(render_normal, gt_normal, exp_t=1.0):
+    cos = torch.sum(render_normal * gt_normal, dim=-1)
+    if exp_t > 0:
+        cos = torch.exp((cos - 1) / exp_t)
+    else:
+        cos = torch.ones_like(cos)
+
+    return cos.detach()
+
+
+def monosdf_normal_loss(normal_pred: torch.Tensor, normal_gt: torch.Tensor, weight: Optional[torch.Tensor] = None):
+    """normal consistency loss as monosdf
+
+    Args:
+        normal_pred (torch.Tensor): volume rendered normal
+        normal_gt (torch.Tensor): monocular normal
+    """
+    if weight is None: weight = 1.0
+    l1 = (weight * torch.abs(normal_pred - normal_gt).sum(dim=-1)).mean()
+    cos = (weight * (1.0 - torch.sum(normal_pred * normal_gt, dim=-1))).mean()
+    return l1 + cos
+
+
 def is_in_view_frustum(
     points:torch.Tensor,
     camera:Camera,
@@ -273,3 +348,49 @@ def identify_out_of_field_points(
         out_of_field_mask[valid_mask] = False
         
     return out_of_field_mask
+
+
+def det3x3(A):
+    """
+    Compute the determinant of a batch of 3x3 matrices.
+    A: [..., 3, 3]
+    """
+    return (A[..., 0, 0] * (A[..., 1, 1] * A[..., 2, 2] - A[..., 1, 2] * A[..., 2, 1]) -
+            A[..., 0, 1] * (A[..., 1, 0] * A[..., 2, 2] - A[..., 1, 2] * A[..., 2, 0]) +
+            A[..., 0, 2] * (A[..., 1, 0] * A[..., 2, 1] - A[..., 1, 1] * A[..., 2, 0]))
+
+
+def inverse3x3(A):
+    """
+    Compute the inverse of a batch of 3x3 matrices using the adjugate matrix.
+    A: [..., 3, 3]
+    """
+    det = det3x3(A)
+    inv_det = 1.0 / (det + 1e-10)
+    
+    # Cofactor matrix elements
+    c00 = A[..., 1, 1] * A[..., 2, 2] - A[..., 1, 2] * A[..., 2, 1]
+    c01 = -(A[..., 1, 0] * A[..., 2, 2] - A[..., 1, 2] * A[..., 2, 0])
+    c02 = A[..., 1, 0] * A[..., 2, 1] - A[..., 1, 1] * A[..., 2, 0]
+    
+    c10 = -(A[..., 0, 1] * A[..., 2, 2] - A[..., 0, 2] * A[..., 2, 1])
+    c11 = A[..., 0, 0] * A[..., 2, 2] - A[..., 0, 2] * A[..., 2, 0]
+    c12 = -(A[..., 0, 0] * A[..., 2, 1] - A[..., 0, 1] * A[..., 2, 0])
+    
+    c20 = A[..., 0, 1] * A[..., 1, 2] - A[..., 0, 2] * A[..., 1, 1]
+    c21 = -(A[..., 0, 0] * A[..., 1, 2] - A[..., 0, 2] * A[..., 1, 0])
+    c22 = A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0]
+    
+    # Adjugate is the transpose of the cofactor matrix
+    invA = torch.empty_like(A)
+    invA[..., 0, 0] = c00
+    invA[..., 1, 0] = c01
+    invA[..., 2, 0] = c02
+    invA[..., 0, 1] = c10
+    invA[..., 1, 1] = c11
+    invA[..., 2, 1] = c12
+    invA[..., 0, 2] = c20
+    invA[..., 1, 2] = c21
+    invA[..., 2, 2] = c22
+    
+    return invA * inv_det.unsqueeze(-1).unsqueeze(-1)

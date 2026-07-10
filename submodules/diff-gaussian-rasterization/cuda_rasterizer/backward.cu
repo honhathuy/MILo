@@ -633,12 +633,14 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	const int num_classes, const int n_features, int W, int H,
 	const float* __restrict__ bg_color,
 	const float* __restrict__ view_points,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ semantic,
+	const float* __restrict__ gaussian_features,
 	const float* __restrict__ depths,
 	const float* __restrict__ ts,
 	const float* __restrict__ camera_planes,
@@ -650,6 +652,8 @@ renderCUDA(
 	const float* __restrict__ normal_length,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_semantic,
+	const float* __restrict__ dL_dpixels_gaussian_features,
 	const float* __restrict__ dL_dpixel_coords,
 	const float* __restrict__ dL_dpixel_mcoords,
 	const float* __restrict__ dL_dpixel_depths,
@@ -664,6 +668,8 @@ renderCUDA(
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dsemantics,
+	float* __restrict__ dL_dgaussian_features,
 	float* __restrict__ dL_dts,
 	float* __restrict__ dL_dcamera_planes,
 	float2* __restrict__ dL_dray_planes,
@@ -690,6 +696,8 @@ renderCUDA(
 
 	bool done = !inside;
 	int toDo = range.y - range.x;
+	if (num_classes > MAX_CLASSES) return;
+	if (n_features > MAX_FEATURES) return;
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
@@ -700,6 +708,8 @@ renderCUDA(
 	__shared__ float collected_normals[3 * BLOCK_SIZE];
 	__shared__ float collected_ts[BLOCK_SIZE];
 	__shared__ float2 collected_ray_planes[BLOCK_SIZE];
+	__shared__ float collected_semantic[MAX_CLASSES * BLOCK_SIZE];
+	__shared__ float collected_gaussian_features[MAX_FEATURES * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -718,6 +728,12 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
+	float accum_semantic_rec[MAX_CLASSES] = { 0 };
+    float dL_dpixel_semantic[MAX_CLASSES] = { 0 };
+    float last_semantic[MAX_CLASSES] = { 0 };
+	float accum_gaussian_features_rec[MAX_FEATURES] = { 0 };
+	float dL_dpixel_gaussian_features[MAX_FEATURES] = { 0 };
+	float last_gaussian_features[MAX_FEATURES] = { 0 };
 	float accum_coord_rec[3] = {0};
 	float dL_dpixel_coord[3];
 	float accum_t_rec = 0;
@@ -732,6 +748,10 @@ renderCUDA(
 	if (inside) {
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < num_classes; i++)
+            dL_dpixel_semantic[i] = dL_dpixels_semantic[i * H * W + pix_id];
+		for (int i = 0; i < n_features; i++)
+			dL_dpixel_gaussian_features[i] = dL_dpixels_gaussian_features[i * H * W + pix_id];
 		dL_dalpha = dL_dalphas[pix_id];
 
 		if constexpr (GEO)
@@ -807,6 +827,10 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int i = 0; i < num_classes; i++)
+				collected_semantic[i * BLOCK_SIZE + block.thread_rank()] = semantic[coll_id * num_classes + i];
+			for (int i = 0; i < n_features; i++)
+				collected_gaussian_features[i * BLOCK_SIZE + block.thread_rank()] = gaussian_features[coll_id * n_features + i];
 			if constexpr (COORD)
 			{
 				for(int ch = 0; ch < 6; ch++)
@@ -876,6 +900,40 @@ renderCUDA(
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			}
+
+			for (int c = 0; c < num_classes; c++)
+            {
+                const float sem = collected_semantic[c * BLOCK_SIZE + j];
+                
+                // Track accumulated semantics from back to front
+                accum_semantic_rec[c] = last_alpha * last_semantic[c] + (1.f - last_alpha) * accum_semantic_rec[c];
+                last_semantic[c] = sem;
+
+                const float dL_dchannel_sem = dL_dpixel_semantic[c];
+                
+                // Propagate gradient into Gaussian's alpha/opacity
+                dL_dopa += (sem - accum_semantic_rec[c]) * dL_dchannel_sem;
+                
+                // Propagate gradient into the Gaussian's semantic feature logit
+                atomicAdd(&(dL_dsemantics[global_id * num_classes + c]), dchannel_dcolor * dL_dchannel_sem);
+            }
+
+			for (int f = 0; f < n_features; f++)
+			{
+				const float feat = collected_gaussian_features[f * BLOCK_SIZE + j];
+
+				// Track accumulated features from back to front
+				accum_gaussian_features_rec[f] = last_alpha * last_gaussian_features[f] + (1.f - last_alpha) * accum_gaussian_features_rec[f];
+				last_gaussian_features[f] = feat;
+
+				const float dL_dchannel_feat = dL_dpixel_gaussian_features[f];
+
+				// Propagate gradient into Gaussian's alpha/opacity
+				dL_dopa += (feat - accum_gaussian_features_rec[f]) * dL_dchannel_feat;
+
+				// Propagate gradient into the Gaussian's features representation
+				atomicAdd(&(dL_dgaussian_features[global_id * n_features + f]), dchannel_dcolor * dL_dchannel_feat);
 			}
 			
 			float dL_dcoords[3];
@@ -1102,12 +1160,14 @@ void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	const int num_classes, const int n_features, int W, int H,
 	const float* bg_color,
 	const float* view_points,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* semantic,
+	const float* gaussian_features,
 	const float* depths,
 	const float* ts,
 	const float* camera_planes,
@@ -1119,6 +1179,8 @@ void BACKWARD::render(
 	const float* normal_length,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixels_semantic,
+	const float* dL_dpixels_gaussian_features,
 	const float* dL_dpixel_coords,
 	const float* dL_dpixel_mcoords,
 	const float* dL_dpixel_depth,
@@ -1133,6 +1195,8 @@ void BACKWARD::render(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
+	float* dL_dsemantics,
+	float* dL_dgaussian_features,
 	float* dL_dts,
 	float* dL_dcamera_planes,
 	float2* dL_dray_planes,
@@ -1142,13 +1206,13 @@ void BACKWARD::render(
 {
 #define RENDER_CUDA_CALL(template_coord, template_depth, template_normal) \
     renderCUDA<NUM_CHANNELS, template_coord, template_depth, template_normal> <<<grid, block>>> ( \
-        ranges, point_list, W, H, bg_color, view_points, means2D, conic_opacity, colors, \
-        depths, ts, camera_planes, ray_planes, alphas, normals, \
+        ranges, point_list, num_classes, n_features, W, H, bg_color, view_points, means2D, conic_opacity, colors, \
+        semantic, gaussian_features, depths, ts, camera_planes, ray_planes, alphas, normals, \
 		accum_coord, accum_depth, normal_length, \
-        n_contrib, dL_dpixels, dL_dpixel_coords, dL_dpixel_mcoords, dL_dpixel_depth, \
+        n_contrib, dL_dpixels, dL_dpixels_semantic, dL_dpixels_gaussian_features, dL_dpixel_coords, dL_dpixel_mcoords, dL_dpixel_depth, \
         dL_dpixel_mdepth, dL_dalphas, dL_dpixel_normals, normalmap, \
         focal_x, focal_y, dL_dmean3D, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, \
-        dL_dts, dL_dcamera_planes, dL_dray_planes, dL_dnormals)
+        dL_dsemantics, dL_dgaussian_features, dL_dts, dL_dcamera_planes, dL_dray_planes, dL_dnormals)
 
 	if (require_coord && require_depth)
 		RENDER_CUDA_CALL(true, true, true);

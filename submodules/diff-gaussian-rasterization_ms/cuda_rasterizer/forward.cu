@@ -295,10 +295,10 @@ renderCUDA(
 	const uint32_t* __restrict__ point_list,
 	const uint32_t* __restrict__ per_tile_bucket_offset, uint32_t* __restrict__ bucket_to_tile,
 	float* __restrict__ sampled_T, float* __restrict__ sampled_ar,
-	int W, int H,
+	int W, int H, const int num_classes,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
-
+	const float* __restrict__ semantic,
 	const bool flag_max_count,
 	float* __restrict__ accum_max_count,
 
@@ -307,7 +307,8 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color
+	float* __restrict__ out_color,
+	float* __restrict__ out_semantic
 	)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -329,6 +330,7 @@ renderCUDA(
 	uint2 range = ranges[tile_id];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
+	if (num_classes > MAX_CLASSES) return;
 
 	// what is the number of buckets before me? what is my offset?
 	uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
@@ -347,12 +349,14 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_semantic[BLOCK_SIZE * MAX_CLASSES];
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float S[MAX_CLASSES] = { 0 };
 
 	float weight_max=0;
 
@@ -375,6 +379,8 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int c = 0; c < num_classes; c++)
+				collected_semantic[c * BLOCK_SIZE + block.thread_rank()] = semantic[coll_id * num_classes + c];
 		}
 		block.sync();
 
@@ -385,7 +391,10 @@ renderCUDA(
 			if (j % 32 == 0) {
 				sampled_T[(bbm * BLOCK_SIZE) + block.thread_rank()] = T;
 				for (int ch = 0; ch < CHANNELS; ++ch) {
-					sampled_ar[(bbm * BLOCK_SIZE * CHANNELS) + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
+					sampled_ar[(bbm * BLOCK_SIZE * (CHANNELS + MAX_CLASSES)) + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
+				}
+				for (int cls = 0; cls < num_classes; ++cls) {
+					sampled_ar[(bbm * BLOCK_SIZE * (CHANNELS + MAX_CLASSES)) + (CHANNELS + cls) * BLOCK_SIZE + block.thread_rank()] = S[cls];
 				}
 				++bbm;
 			}			
@@ -420,6 +429,8 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			for (int c = 0; c < num_classes; c++)
+				S[c] += collected_semantic[j + BLOCK_SIZE * c] * alpha * T;
 
 			if(weight_max<alpha * T)
 			{
@@ -450,6 +461,8 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];	
+		for (int c = 0; c < num_classes; c++)
+			out_semantic[c * H * W + pix_id] = S[c];
 	}
 
 	// max reduce the last contributor
@@ -859,10 +872,10 @@ void FORWARD::render(
 	const uint32_t* point_list,
 	const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
 	float* sampled_T, float* sampled_ar,	
-	int W, int H,
+	int W, int H, const int num_classes,
 	const float2* means2D,
 	const float* colors,
-
+	const float* semantic,
 	const bool flag_max_count,
 	float* accum_max_count,
 	
@@ -871,7 +884,8 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	uint32_t* max_contrib,
 	const float* bg_color,
-	float* out_color
+	float* out_color,
+	float* out_semantic
 	)
 {
 	renderCUDA<NUM_CHAFFELS> << <grid, block >> > (
@@ -879,9 +893,10 @@ void FORWARD::render(
 		point_list,
 		per_tile_bucket_offset, bucket_to_tile,
 		sampled_T, sampled_ar,		
-		W, H,
+		W, H, num_classes,
 		means2D,
 		colors,
+		semantic,
 		flag_max_count,
 		accum_max_count,
 		conic_opacity,
@@ -889,7 +904,8 @@ void FORWARD::render(
 		n_contrib,
 		max_contrib,
 		bg_color,
-		out_color
+		out_color,
+		out_semantic
 		);
 }
 

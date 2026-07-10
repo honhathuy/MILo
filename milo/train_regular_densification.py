@@ -61,6 +61,7 @@ def training(
     use_mip_filter = not args.disable_mip_filter
     gaussians = GaussianModel(
         sh_degree=dataset.sh_degree, 
+        num_classes=args.num_classes,
         use_mip_filter=use_mip_filter, 
         learn_occupancy=args.mesh_regularization,
         use_appearance_network=args.decoupled_appearance,
@@ -96,6 +97,7 @@ def training(
     viewpoint_stack = None
     postfix_dict = {}
     ema_loss_for_log = 0.0
+    ema_semantic_loss_for_log = 0.0
     ema_depth_normal_loss_for_log = 0.0
     
     # ---Prepare Mesh-In-the-Loop Regularization---
@@ -187,14 +189,17 @@ def training(
             viewpoint_cam, gaussians, pipe, background,
             require_coord=False, 
             require_depth=True and (reg_kick_on or mesh_kick_on or depth_order_kick_on),
+            flag_max_count=False,
         )
 
         # ---Compute losses---
+        semantic_loss = None
         image, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"], render_pkg["viewspace_points"], 
             render_pkg["visibility_filter"], render_pkg["radii"]
         )
         gt_image = viewpoint_cam.original_image.cuda()
+        gt_semantic_mask = viewpoint_cam.semantic_mask.cuda() if viewpoint_cam.semantic_mask is not None else None
 
         # Rendering loss
         if args.decoupled_appearance:
@@ -203,6 +208,11 @@ def training(
             Ll1 = l1_loss(image, gt_image)
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+        # Semantic loss
+        if "semantic" in render_pkg and gt_semantic_mask is not None:
+            semantic_loss = torch.nn.functional.cross_entropy(render_pkg["semantic"].unsqueeze(0), gt_semantic_mask.unsqueeze(0))
+            loss = loss + opt.lambda_semantic * semantic_loss
         
         # Depth-Normal Consistency Regularization
         if reg_kick_on:
@@ -295,11 +305,12 @@ def training(
         iter_end.record()
 
         with torch.no_grad():
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if semantic_loss is not None:
+                ema_semantic_loss_for_log = 0.4 * semantic_loss.item() + 0.6 * ema_semantic_loss_for_log
             # ---Logging---
             (
-                postfix_dict,
-                ema_loss_for_log, 
-                ema_depth_normal_loss_for_log, 
+                postfix_dict, ema_loss_for_log, ema_semantic_loss_for_log, ema_depth_normal_loss_for_log, 
                 ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
                 ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
                 ema_depth_order_loss_for_log
@@ -315,9 +326,9 @@ def training(
                 occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
                 depth_prior_loss if depth_order_kick_on else None,
                 mesh_config if mesh_kick_on else None, 
-                postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
-                ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
-                ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp,
+                postfix_dict, ema_loss_for_log, ema_semantic_loss_for_log, ema_depth_normal_loss_for_log, 
+                ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+                ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp, semantic_loss if gt_semantic_mask is not None else None,
             )
 
             # ---Densification---

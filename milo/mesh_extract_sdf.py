@@ -1,13 +1,15 @@
 import yaml
 import torch
+import torch.nn as nn
 from functools import partial
 from scene import Scene
 import os
 from os import makedirs
 import random
+import copy
 from tqdm import tqdm
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
+from arguments import ModelParams, PipelineParams, GraphCutParams, get_combined_args
 from gaussian_renderer import GaussianModel, render_simp
 import numpy as np
 import trimesh
@@ -24,6 +26,7 @@ from regularization.sdf.learnable import compute_initial_sdf_with_binary_search
 
 import gc
 from utils.geometry_utils import depth_to_normal as depth_double_to_normal
+from torchvision.utils import save_image
 from regularization.sdf.learnable import convert_occupancy_to_sdf, convert_sdf_to_occupancy
 from utils.geometry_utils import (
     flatten_voronoi_features, 
@@ -33,6 +36,7 @@ from utils.geometry_utils import (
 )
 
 from scene.gaussian_model import SparseGaussianAdam
+from graphcut_segmentation import graphcut_segmentation, load_gc_args
 
 from tetranerf.utils.extension import cpp
 import time
@@ -49,6 +53,7 @@ def extract_mesh_with_sdf_refinement(
     dataset, 
     iteration, 
     pipe, 
+    graphcutparams,
     n_delaunay_sites, 
     mtet_on_cpu,
     refine_iter,
@@ -61,10 +66,88 @@ def extract_mesh_with_sdf_refinement(
     device = torch.device(torch.cuda.current_device())
     
     # Load Gaussian model
-    gaussians = GaussianModel(dataset.sh_degree)
+    print("[DEBUG] Initializing Gaussian Model...")
+    gaussians = GaussianModel(sh_degree=dataset.sh_degree, num_classes=dataset.num_classes)
+    print("[DEBUG] Initializing Scene (Camera Loading)...")
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    print("[DEBUG] Loading PLY (Gaussian Loading)...")
     gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"))
+    print("[DEBUG] Setting occupancy mode...")
     gaussians.set_occupancy_mode(mesh_config["occupancy_mode"])
+
+    # if args.target_class != -1:
+    #     print(f"[INFO] Hard-pruning Gaussians for target class ID: {args.target_class}")
+    #     with torch.no_grad():
+    #         # # Create a boolean mask of points we want to KEEP
+    #         # keep_mask = (gaussians.get_semantic.argmax(dim=-1) == args.target_class)
+            
+    #         # # Overwrite all tensors with only the kept points
+    #         # gaussians._xyz = nn.Parameter(gaussians._xyz[keep_mask.to(gaussians._xyz.device)].requires_grad_(True))
+    #         # gaussians._features_dc = nn.Parameter(gaussians._features_dc[keep_mask.to(gaussians._features_dc.device)].requires_grad_(True))
+    #         # gaussians._features_rest = nn.Parameter(gaussians._features_rest[keep_mask.to(gaussians._features_rest.device)].requires_grad_(True))
+    #         # gaussians._opacity = nn.Parameter(gaussians._opacity[keep_mask.to(gaussians._opacity.device)].requires_grad_(True))
+    #         # gaussians._scaling = nn.Parameter(gaussians._scaling[keep_mask.to(gaussians._scaling.device)].requires_grad_(True))
+    #         # gaussians._rotation = nn.Parameter(gaussians._rotation[keep_mask.to(gaussians._rotation.device)].requires_grad_(True))
+    #         # gaussians._semantic = nn.Parameter(gaussians._semantic[keep_mask.to(gaussians._semantic.device)].requires_grad_(True))
+            
+    #         # if gaussians.learn_occupancy:
+    #         #     gaussians._base_occupancy = nn.Parameter(gaussians._base_occupancy[keep_mask.to(gaussians._base_occupancy.device)].requires_grad_(False))
+    #         #     gaussians._occupancy_shift = nn.Parameter(gaussians._occupancy_shift[keep_mask.to(gaussians._occupancy_shift.device)].requires_grad_(True))
+            
+    #         # if hasattr(gaussians, 'max_radii2D') and gaussians.max_radii2D.shape[0] > 0:
+    #         #      gaussians.max_radii2D = gaussians.max_radii2D[keep_mask.to(gaussians.max_radii2D.device)]
+            
+    #         # if hasattr(gaussians, 'filter_3D'):
+    #         #      gaussians.filter_3D = gaussians.filter_3D[keep_mask.to(gaussians.filter_3D.device)]
+
+    #         # if hasattr(gaussians, '_culling'):
+    #         #      gaussians._culling = gaussians._culling[keep_mask.to(gaussians._culling.device)]
+                 
+    #         # print(f"Kept {keep_mask.sum().item()} Gaussians.")
+
+    #         weights = torch.zeros_like(gaussians._opacity)
+    #         weights_cnt = torch.zeros_like(gaussians._opacity)
+    #         gaussians_for_sink = copy.deepcopy(gaussians)
+    #         gaussians_for_source = copy.deepcopy(gaussians)
+    #         weights_sink = torch.zeros_like(gaussians._opacity)
+    #         weights_cnt_sink = torch.zeros_like(gaussians._opacity)
+    #         view_points = scene.getTrainCameras().copy()
+            
+    #         # Ensure debug directory exists
+    #         debug_dir = os.path.join(dataset.model_path, "graphcut")
+    #         os.makedirs(debug_dir, exist_ok=True)
+
+    #         for index, _ in enumerate(tqdm(view_points,  desc="Coarse rasterization progress")):
+    #             # Create a single-channel mask (1.0 for target class, 0.0 otherwise)
+    #             mask = (view_points[index].semantic_mask == args.target_class).float().cuda()
+    #             if mask.dim() == 2:
+    #                 mask = mask.unsqueeze(0) # (1, H, W)
+                
+    #             # Use the camera object as the first argument
+    #             gaussians_for_source.apply_weights(view_points[index], weights, weights_cnt, mask)
+    #             gaussians_for_sink.apply_weights(view_points[index], weights_sink, weights_cnt_sink, 1.0 - mask)
+            
+    #         foreground_threshold = 0.9
+    #         weights = torch.where(weights_cnt == 0, torch.zeros_like(weights),
+    #                           weights / weights_cnt)
+    #         selected_mask = weights >= foreground_threshold
+            
+    #         print("Number of gaussians removed: ", torch.sum(selected_mask.int() == 0).item())
+    #         print("Number of gaussians kept: ", torch.sum(selected_mask.int() == 1).item())
+    #         print("Number of gaussians before: ", len(gaussians._opacity))
+
+    #         gaussians_for_source.remove_low_score_gaussians(selected_mask.bool().squeeze(1))
+    #         gaussians_for_source.save_ply(os.path.join(debug_dir, "gaussians_source.ply"))
+
+    #         weights_sink = torch.where(weights_cnt_sink == 0, torch.ones_like(weights_sink), weights_sink / weights_cnt_sink)
+    #         selected_mask_sink = weights < foreground_threshold
+    #         print("Number of gaussians removed sink: ", torch.sum(selected_mask_sink.int() == 0).item())
+    #         print("Number of gaussians kept sink: ", torch.sum(selected_mask_sink.int() == 1).item())
+    #         gaussians_for_sink.remove_low_score_gaussians(selected_mask_sink.bool().squeeze(1))
+    #         # gaussians_for_sink.save_ply(os.path.join(debug_dir, "gaussians_sink.ply"))
+
+    #         foreground, background_index = graphcut_segmentation(args, dataset.model_path, graphcutparams, weights, weights_sink, gaussians, gaussians_for_source, gaussians_for_sink)
+    #         gaussians.remove_low_score_gaussians((background_index == 0))
     
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -238,6 +321,18 @@ def extract_mesh_with_sdf_refinement(
             normal = render_pkg["normal"].detach()
             median_depth_to_normal = depth_double_to_normal(viewpoint_cam, median_depth)
             radii = render_pkg["radii"].detach()
+
+            # Save rendered images periodically
+            save_every = 100 
+            if iteration % save_every == 0 or iteration == 1:
+                render_save_dir = os.path.join(dataset.model_path, "refinement_renders")
+                os.makedirs(render_save_dir, exist_ok=True)
+                save_image(rgb, os.path.join(render_save_dir, f"rgb_{iteration:04d}_{viewpoint_idx:03d}.png"))
+                
+                # Normalize depth for visualization
+                d_min, d_max = median_depth.min(), median_depth.max()
+                depth_norm = (median_depth - d_min) / (d_max - d_min + 1e-5)
+                save_image(depth_norm, os.path.join(render_save_dir, f"depth_{iteration:04d}_{viewpoint_idx:03d}.png"))
         
         # --- Extract the Mesh ---
         # Compute the SDF
@@ -309,6 +404,7 @@ def extract_mesh_with_sdf_refinement(
         # --- Reset occupancy labels ---
         if mesh_config["use_occupancy_labels_loss"] and (iteration % mesh_config["reset_occupancy_labels_every"] == 0):
             print(f"[INFO] Resetting occupancy labels at iteration {iteration}.")
+            
             occupancy_labels, vert_colors = evaluate_mesh_occupancy(
                 points=voronoi_points,
                 views=train_cameras,
@@ -323,9 +419,13 @@ def extract_mesh_with_sdf_refinement(
         
         # Mesh Depth Loss
         if mesh_config["use_depth_loss"]:
+            # Use Expected Depth (blended) more heavily if median depth is noisy
+            # You can tweak this ratio in your config: 0.0 is only expected_depth, 1.0 is only median_depth
+            depth_ratio = mesh_config.get("depth_ratio", 0.5)
+            
             gaussians_depth = (
-                (1. - mesh_config["depth_ratio"]) * render_pkg["expected_depth"] 
-                + mesh_config["depth_ratio"] * render_pkg["median_depth"]
+                (1. - depth_ratio) * render_pkg["expected_depth"] 
+                + depth_ratio * render_pkg["median_depth"]
             ).squeeze()  # (H, W)
             
             if mesh_config["mesh_depth_loss_type"] == "log":
@@ -521,7 +621,7 @@ def extract_mesh_with_sdf_refinement(
         print(f"[INFO] Computing vertex colors.")
         vert_colors = evaluate_mesh_colors_all_vertices(
             views=train_cameras, 
-            mesh=Meshes(verts=verts, faces=faces),
+            mesh=Meshes(verts=verts, faces=faces if dmtet_face_mask is None else faces[dmtet_face_mask]),
             masks=None,
             use_scalable_renderer=mesh_config["use_scalable_renderer"],
         )
@@ -540,7 +640,8 @@ def extract_mesh_with_sdf_refinement(
         if dmtet_face_mask is not None:
             mesh.update_faces(dmtet_face_mask.cpu().numpy())
 
-        mesh.export(os.path.join(dataset.model_path,f"mesh_learnable_sdf.ply"))
+        save_name = f"mesh_learnable_sdf_class_{args.target_class}.ply" if args.target_class != -1 else "mesh_learnable_sdf.ply"
+        mesh.export(os.path.join(dataset.model_path, save_name))
 
 
 if __name__ == "__main__":
@@ -548,6 +649,7 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
+    graphcutparams = GraphCutParams(parser)
     parser.add_argument("--iteration", default=18000, type=int)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--n_delaunay_sites", default=-1, type=int)
@@ -571,6 +673,8 @@ if __name__ == "__main__":
     parser.add_argument("--min_occupancy_value", default=1e-10, type=float)
     parser.add_argument("--n_binary_steps_to_reset_sdf", default=8, type=int)
     parser.add_argument("--sdf_reset_linearization_n_steps", default=20, type=int)
+    parser.add_argument("--target_class", default=-1, type=int, help="Extract mesh only for this class ID. -1 for all.")
+    load_gc_args(parser)
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
     
@@ -605,6 +709,7 @@ if __name__ == "__main__":
         model.extract(args), 
         args.iteration, 
         pipeline.extract(args), 
+        graphcutparams,
         n_delaunay_sites=args.n_delaunay_sites, 
         mtet_on_cpu=args.mtet_on_cpu,
         refine_iter=args.refine_iter,

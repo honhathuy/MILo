@@ -1,0 +1,126 @@
+python train.py -s ./data/gardenspheres -m ./output/gardenspheres --imp_metric outdoor --rasterizer radegs -r 4 --data_device "cpu"
+
+
+
+
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs -r 2 --data_device "cpu"
+optimization time: 1:41:44, images resolution: 832x539
+
+extract mesh:
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs -r 2
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu"
+
+
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --detach_gaussian_rendering
+optimization time: 2:43:46, images resolution: 1666x1080
+Average VRAM usage: 8GB, Peak: 12GB
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs
+
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --no_mesh_regularization
+Average VRAM usage: 4GB
+optimization time: 17:17, images resolution: 1666x1080
+python mesh_extract_integration.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" -r 2 --num_classes 2 --log_interval 1000
+Average VRAM usage: 6GB
+optimization time: 1:09:38
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs -r 2 --num_classes 2 --target_class 0
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs -r 2 --num_classes 2 --target_class 1
+
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden --rasterizer radegs -r 2 --remove_oof_vertices
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 
+peak 14GB in first 3000 iter
+Peak 12GB, Avg 10GB from iteration 8000
+images resolution: 1666x1080
+optimization time: 2:56:00
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs -r 2 --remove_oof_vertices --num_classes 0
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 --log_interval 1000 --detach_gaussian_rendering
+peak 14GB in first 3000 iter
+Peak 12GB, Avg 8.6GB from iteration 8000
+images resolution: 1666x1080
+change mesh extraction interval from 1 to 5
+optimization time: 1:28:11
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs --remove_oof_vertices --num_classes 0
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 --depth_order
+peak 23.1GB, avg 20GB in first 3000 iter
+Peak 13.3GB, Avg 8.9GB from iteration 8000
+
+
+after enhance render_full
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 --depth_order
+peak 7.8GB in first 3000 iter
+Peak 13.3GB, Avg 8.9GB from iteration 8000
+optimization time: 1:31:05
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs --remove_oof_vertices --num_classes 0
+[ITER 18000] Evaluating train:  [20/05 22:00:26]
+  SSIM :    0.8625520 [20/05 22:00:26]
+  PSNR :   27.4979977 [20/05 22:00:26]
+  LPIPS :    0.1610792 [20/05 22:00:26]
+ [20/05 22:00:26]
+ 
+CDGS dept reg and VCR-Gauss normal reg
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 --depth_order --disable_confidence
+Peak 11.4GB, Avg 11.2GB from iteration 8000
+optimization time: 1:03:37
+[ITER 18000] Evaluating train:  [23/05 12:35:19]
+  SSIM :    0.8521387 [23/05 12:35:19]
+  PSNR :   27.1583862 [23/05 12:35:19]
+  LPIPS :    0.1755210 [23/05 12:35:19]
+ [23/05 12:35:19]
+python mesh_extract_sdf.py -s ./data/garden/undistorted -m ./output/garden2 --rasterizer radegs --remove_oof_vertices --num_classes 0 --no_depth_prior
+
+
+
+python train.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --num_classes 0 --depth_order --disable_confidence --detach_gaussian_rendering
+optimization time: 56:56
+Peak 11.4GB, Avg 11.2GB from iteration 8000
+[ITER 18000] Evaluating train:  [27/05 10:19:14]
+  SSIM :    0.8531810 [27/05 10:19:14]
+  PSNR :   27.1927639 [27/05 10:19:14]
+  LPIPS :    0.1736199 [27/05 10:19:14]
+ [27/05 10:19:14]
+
+
+python train2.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --depth_order --disable_confidence --use_normal_field
+[ITER 18000] Evaluating train:  [29/05 12:11:13]
+  SSIM :    0.8480794 [29/05 12:11:13]
+  PSNR :   27.0617413 [29/05 12:11:13]
+  LPIPS :    0.1795765 [29/05 12:11:13]
+ [29/05 12:11:13]
+python pivot_based_mesh_extraction.py -s ./data/garden/undistorted -m ./output/garden2 --no_depth_prior --sdf_mode "exact_computation" --rasterizer "radegs" --isosurface_value 0.2 --n_binary_steps "10" --iteration "18000" --use_valid_mask --postprocess --std_factor "3.33" --use_searched_pivots --search_iter "5" --search_step_size "0.33" --data_device "cpu" 
+
+
+
+python train2.py -s ./data/garden/undistorted -m ./output/garden2 --imp_metric outdoor --rasterizer radegs --data_device "cpu" --depth_order --use_normal_field --N_max_gaussians 2000000 --multiview
+5.5GB, 38:32
+[ITER 18000] Evaluating train:  [03/06 10:19:10]
+  SSIM :    0.8605779 [03/06 10:19:10]
+  PSNR :   27.4248341 [03/06 10:19:10]
+  LPIPS :    0.1576492 [03/06 10:19:10]
+ [03/06 10:19:10]
+python pivot_based_mesh_extraction.py -s ./data/garden/undistorted -m ./output/garden2 --no_depth_prior --sdf_mode "exact_computation" --rasterizer "radegs" --isosurface_value 0.2 --n_binary_steps "10" --iteration "18000" --use_valid_mask --postprocess --std_factor "3.33" --use_searched_pivots --search_iter "5" --search_step_size "0.33" --data_device "cpu" 
+
+
+python render_mesh_video.py -m ./output/garden2 --mesh E:\Learning\hcmus\3d_reconstructions\MILo\milo\output\garden2\mesh_exact_computation_9pivots_transmittance_threshold_0.7_searched.ply
+

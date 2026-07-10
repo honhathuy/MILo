@@ -306,7 +306,7 @@ def compute_mesh_regularization(
         # Pass delaunay_xyz_idx which might be None (use all), or indices after opacity/downsampling
         voronoi_points, voronoi_scale = gaussians.get_tetra_points(
             downsample_ratio=None,
-            let_gradients_flow=True,
+            # let_gradients_flow=True,
             xyz_idx=delaunay_xyz_idx, # Pass the computed indices
         )
         voronoi_points_count = voronoi_points.shape[0]

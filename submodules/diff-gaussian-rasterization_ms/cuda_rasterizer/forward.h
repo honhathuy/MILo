@@ -61,10 +61,10 @@ namespace FORWARD
 		const uint32_t* point_list,
 		const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
 		float* sampled_T, float* sampled_ar,		
-		int W, int H,
+		int W, int H, const int num_classes,
 		const float2* points_xy_image,
 		const float* features,
-		
+		const float* semantic,
 		const bool flag_max_count,
 		float* accum_max_count,
 
@@ -73,7 +73,8 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		uint32_t* max_contrib,
 		const float* bg_color,
-		float* out_color
+		float* out_color,
+		float* out_semantic
 		);
 		
 

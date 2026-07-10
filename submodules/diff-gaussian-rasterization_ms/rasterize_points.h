@@ -15,12 +15,13 @@
 #include <tuple>
 #include <string>
 	
-std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, 
+std::tuple<int, int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, 
 torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
+	const torch::Tensor& semantic,
     const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
@@ -99,12 +100,13 @@ RasterizeGaussiansDepthCUDA(
 
 
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
+	const torch::Tensor& semantic,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -114,6 +116,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx, 
 	const float tan_fovy,
     const torch::Tensor& dL_dout_color,
+	const torch::Tensor& dL_dout_semantic,
 	const torch::Tensor& dc,
 	const torch::Tensor& sh,
 	const int degree,
@@ -168,3 +171,13 @@ fusedssim_backward(
 );
 
 
+void applyWeightsGaussiansCUDA(
+	const torch::Tensor &background, const torch::Tensor &means3D,
+	const torch::Tensor &weights, const torch::Tensor &opacity,
+	const torch::Tensor &scales, const torch::Tensor &rotations,
+	const float scale_modifier, torch::Tensor &cov3D_precomp,
+	const torch::Tensor &viewmatrix, const torch::Tensor &projmatrix,
+	const float tan_fovx, const float tan_fovy, const int image_height,
+	const int image_width, const torch::Tensor &sh, const int degree,
+	const torch::Tensor &campos, const bool prefiltered,
+	const torch::Tensor &image_weights, const torch::Tensor &cnt, const bool debug);

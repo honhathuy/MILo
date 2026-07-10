@@ -9,6 +9,9 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from functools import partial
+from typing import Optional, Union
+
 import torch
 import math
 import numpy as np
@@ -30,6 +33,7 @@ try:
 except:
     pass
 from torch.optim import Adam
+from diff_gaussian_rasterization_ms import (GaussianRasterizationSettings, GaussianRasterizer,)
 
 def init_cdf_mask(importance, thres=1.0):
     importance = importance.flatten()   
@@ -45,6 +49,30 @@ def init_cdf_mask(importance, thres=1.0):
         non_prune_mask = torch.ones_like(importance).bool()
         
     return non_prune_mask
+
+
+def camera2rasterizer(viewpoint_camera, bg_color: torch.Tensor, sh_degree: int = 0):
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    return rasterizer
 
 
 class GaussianModel:
@@ -66,14 +94,22 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+        self.semantic_activation = partial(torch.nn.functional.softmax, dim=-1)
+
 
     def __init__(
-        self, sh_degree : int, 
+        self, sh_degree : int,
+        num_classes: int,
         use_mip_filter : bool = False, 
         learn_occupancy : bool = False,
         use_radegs_densification : bool = False,
         use_appearance_network : bool = False,
+        n_gaussian_features : int = 0,
     ):
+        if num_classes > 8:
+            raise ValueError(f"Number of classes ({num_classes}) exceeds MAX_CLASSES (8) defined in the CUDA rasterizer. "
+                             f"Please increase MAX_CLASSES in submodules/diff-gaussian-rasterization/cuda_rasterizer/config.h and recompile.")
+        
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -82,6 +118,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._semantic = torch.empty(0)
+        self.num_classes = num_classes
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -113,6 +151,12 @@ class GaussianModel:
         if self.use_radegs_densification:
             self.xyz_gradient_accum_abs = torch.empty(0)
             self.xyz_gradient_accum_abs_max = torch.empty(0)
+        
+        self.use_gaussian_features = n_gaussian_features > 0
+        self.n_gaussian_features = n_gaussian_features
+        if self.use_gaussian_features:
+            self._gaussian_features = torch.empty(0)
+            self.n_pivots_per_gaussian = 2
 
     def capture(self):
         to_return = (
@@ -123,6 +167,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._semantic,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -133,6 +178,8 @@ class GaussianModel:
             to_return += (self._base_occupancy, self._occupancy_shift)
         if self.use_appearance_network:
             to_return += (self.appearance_network.state_dict(), self._appearance_embeddings,)
+        if self.use_gaussian_features:
+            to_return += (self._gaussian_features,)
         return to_return
     
     def restore(self, model_args, training_args):
@@ -144,6 +191,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._semantic,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -157,6 +205,9 @@ class GaussianModel:
             app_dict = model_args[start_idx]
             self._appearance_embeddings = model_args[start_idx + 1]
             start_idx = start_idx + 2
+        if self.use_gaussian_features:
+            self._gaussian_features = model_args[start_idx]
+            start_idx = start_idx + 1
         if start_idx != len(model_args):
             print(f"[ WARNING ] Restoring model with extra arguments: Only {start_idx} arguments expected, but {len(model_args)} provided.")
         
@@ -240,6 +291,13 @@ class GaussianModel:
         else:
             return self.get_scaling, self.get_opacity
     
+    @property
+    def get_semantic(self):
+        if self.num_classes > 0:
+            return self.semantic_activation(self._semantic)
+        else:
+            return None
+    
     @torch.no_grad()
     def set_occupancy_mode(self, mode: str):
         if not self.learn_occupancy:
@@ -273,7 +331,72 @@ class GaussianModel:
                 raise ValueError(f"Unknown occupancy mode: {self._occupancy_mode}")
         else:
             raise ValueError("Occupancy is not learned")
+    
+    @property
+    def get_sdf(self):
+        """
+        Get the SDF of the Gaussians, following Object as volumes.
+        In this context, the SDF is modeled as being proportional to -psi^-1(occupancy),
+        where psi is the inverse of a sigmoid function.
+        This corresponds to using the opposite of our occupancy logits.
+
+        Returns:
+            torch.Tensor: The SDF of the Gaussians. Has shape (N_gaussians, n_pivots_per_gaussian).
+        """
+        return -1. * self.get_occupancy_logit
         
+    @property
+    def get_gaussian_features(self):
+        if self.use_gaussian_features:
+            return self._gaussian_features
+        else:
+            raise ValueError("Pivot features are not used")
+    
+    @property
+    def get_pivot_features(self):
+        n_gaussians = self._xyz.shape[0]
+
+        # Convert Gaussian features to pivots features
+        pivots_features = self.get_gaussian_features.view(
+            n_gaussians, self.n_pivots_per_gaussian, -1
+        )  # (N_gaussians, n_pivots_per_gaussian, n_pivot_features)
+        
+        return pivots_features
+    
+    def convert_features_to_normals(self, normalize: bool = True, use_smallest_axis: Optional[bool] = None):
+        assert self.use_gaussian_features
+        
+        # If None, falls back to default behavior:
+        # - If n_gaussian_features == 1, use the smallest axis
+        # - If n_gaussian_features == 4, use the full learnable normals
+        if use_smallest_axis is None:
+            assert self.n_gaussian_features in [1, 4], "Invalid number of Gaussian features"
+            use_smallest_axis = self.n_gaussian_features == 1
+        
+        # Check that the number of Gaussian features is consistent with the chosen mode
+        if use_smallest_axis:
+            assert self.n_gaussian_features == 1
+        else:
+            assert self.n_gaussian_features == 4
+            
+        # Get the Gaussian features
+        features = self.get_gaussian_features
+        
+        # Get the normal directions
+        if use_smallest_axis:
+            normal_directions = self.get_smallest_axis  # (N_gaussians, 3)
+        else:
+            normal_directions = features[:, :3]  # (N_gaussians, 3)
+            if normalize:
+                normal_directions = torch.nn.functional.normalize(normal_directions, dim=-1)
+
+        # Get the normal signs
+        normal_signs = torch.tanh(features[:, -1:])  # (N_gaussians, 1)
+
+        # Get the normal vectors by multiplying the directions and signs
+        feature_normals = normal_directions * normal_signs  # (N_gaussians, 3)
+        return feature_normals
+
     @torch.no_grad()
     def reset_occupancy(self, base_occupancy, gaussian_idx=None, occupancy=None):
         if self.learn_occupancy:
@@ -299,6 +422,49 @@ class GaussianModel:
                 raise ValueError(f"Unknown occupancy mode: {self._occupancy_mode}")
         else:
             raise ValueError("Occupancy is not learned")    
+    
+    @torch.no_grad()
+    def reset_gaussian_features(self, gaussian_features: Union[torch.Tensor, float]=0.0):
+        if self.use_gaussian_features:
+            if isinstance(gaussian_features, torch.Tensor):
+                self._gaussian_features[...] = gaussian_features.to(self._gaussian_features.device)  # (N_gaussians, n_gaussian_features)
+            else:
+                self._gaussian_features[...] = gaussian_features * torch.ones_like(self._gaussian_features)
+        else:
+            raise ValueError("Gaussian features are not used")
+        
+    @torch.no_grad()
+    def reset_normal_features(self, reset_directions: bool = True, reset_signs: bool = True):
+        assert self.use_gaussian_features
+        assert self.n_gaussian_features in [1, 4]
+        
+        # Reset the normal signs to 0
+        if reset_signs:
+            self._gaussian_features[:, -1:] = 0.0
+        
+        # Reset the normal directions to shortest Gaussian axis
+        if reset_directions:
+            if self.n_gaussian_features == 1:
+                pass
+            
+            elif self.n_gaussian_features == 4:
+                # Reset the normal directions to shortest Gaussian axis
+                #   > Get min scale
+                scale = self.get_scaling_with_3D_filter  # (N_gaussians, 3)
+                min_scaling_idx = torch.argmin(scale, dim=-1, keepdim=True)  # (N_gaussians, 1)
+                #   > Get rotation matrix
+                rotation_matrices = build_rotation(self._rotation)  # (N_gaussians, 3, 3)
+                #   > Get column of rotation matrix corresponding to min scale
+                gaussian_shortest_axis = torch.gather(
+                    input=rotation_matrices,  # (N_gaussians, 3, 3)
+                    index=min_scaling_idx.unsqueeze(1).repeat(1, 3, 1),  # (N_gaussians, 3, 1)
+                    dim=2,
+                ).squeeze(-1)  # (N_gaussians, 3)
+                
+                self._gaussian_features[:, :3] = gaussian_shortest_axis
+            
+            else:
+                raise ValueError(f"Invalid number of Gaussian features: {self.n_gaussian_features}")
     
     def get_appearance_embedding(self, idx):
         return self._appearance_embeddings[idx]
@@ -399,6 +565,11 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        if self.num_classes > 0:
+            semantic = torch.zeros((fused_point_cloud.shape[0], self.num_classes), device="cuda")
+            self._semantic = nn.Parameter(semantic.requires_grad_(True))
+        else:
+            self._semantic = nn.Parameter(torch.empty((fused_point_cloud.shape[0], 0), dtype=torch.float, device="cuda").requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
             
         if self.learn_occupancy:
@@ -406,6 +577,10 @@ class GaussianModel:
             occupancy_shift = torch.zeros((self._xyz.shape[0], 9), device="cuda")
             self._base_occupancy = nn.Parameter(base_occupancy.requires_grad_(False), requires_grad=False)  # Do not learn base occupancy
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))  # Learn occupancy shift
+        
+        if self.use_gaussian_features:
+            gaussian_features = torch.zeros((self._xyz.shape[0], self.n_gaussian_features), device="cuda")
+            self._gaussian_features = nn.Parameter(gaussian_features.requires_grad_(True))
         
     def _get_tetra_points(
         self, 
@@ -551,8 +726,11 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
+        
+        if self.num_classes > 0:
+            l.append({'params': [self._semantic], 'lr': training_args.feature_lr, "name": "semantic"})
             
         if self.learn_occupancy:
             l.append({'params': [self._occupancy_shift], 'lr': training_args.opacity_lr, "name": "occupancy_shift"})
@@ -562,6 +740,10 @@ class GaussianModel:
                 {'params': [self._appearance_embeddings], 'lr': training_args.appearance_embeddings_lr, "name": "appearance_embeddings"},
                 {'params': self.appearance_network.parameters(), 'lr': training_args.appearance_network_lr, "name": "appearance_network"}
             ]
+
+        if self.use_gaussian_features:
+            # TODO: Add a proper learning rate in training_args.
+            l.append({'params': [self._gaussian_features], 'lr': 0.05/2.0, "name": "gaussian_features"})
 
         if self.use_appearance_network:
             self.optimizer = Adam(l, lr=0.0, eps=1e-15)
@@ -595,6 +777,8 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(self._semantic.shape[1]):
+            l.append('semantic_{}'.format(i))
         if self.use_mip_filter:
             l.append('filter_3D')
         if self.learn_occupancy:
@@ -602,6 +786,9 @@ class GaussianModel:
                 l.append('base_occupancy_{}'.format(i))
             for i in range(self._occupancy_shift.shape[1]):
                 l.append('occupancy_shift_{}'.format(i))
+        if self.use_gaussian_features:
+            for i in range(self._gaussian_features.shape[1]):
+                l.append('gaussian_features_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -614,6 +801,7 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        semantic = self._semantic.detach().cpu().numpy()
         
         if self.use_mip_filter:
             filter_3D = self.filter_3D.detach().cpu().numpy()
@@ -621,15 +809,20 @@ class GaussianModel:
         if self.learn_occupancy:
             base_occupancy = self._base_occupancy.detach().cpu().numpy()
             occupancy_shift = self._occupancy_shift.detach().cpu().numpy()
+        
+        if self.use_gaussian_features:
+            gaussian_features = self._gaussian_features.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        to_concatenate = (xyz, normals, f_dc, f_rest, opacities, scale, rotation)
+        to_concatenate = (xyz, normals, f_dc, f_rest, opacities, scale, rotation, semantic)
         if self.use_mip_filter:
             to_concatenate = to_concatenate + (filter_3D,)
         if self.learn_occupancy:
             to_concatenate = to_concatenate + (base_occupancy, occupancy_shift)
+        if self.use_gaussian_features:
+            to_concatenate = to_concatenate + (gaussian_features,)
         attributes = np.concatenate(to_concatenate, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -708,6 +901,12 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
         
+        semantic_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("semantic_")]
+        semantic_names = sorted(semantic_names, key = lambda x: int(x.split('_')[-1]))
+        semantic = np.zeros((xyz.shape[0], len(semantic_names)))
+        for idx, attr_name in enumerate(semantic_names):
+            semantic[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        
         base_occupancy_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("base_occupancy_")]
         occupancy_shift_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("occupancy_shift_")]
         if len(base_occupancy_names) > 0:
@@ -725,6 +924,19 @@ class GaussianModel:
         else:
             print(f"[INFO] No base occupancy found in ply file.")
             self.learn_occupancy = False
+        
+        gaussian_features_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("gaussian_features_")]
+        if len(gaussian_features_names) > 0:
+            print(f"[INFO] Loading gaussian features from ply file.")
+            self.use_gaussian_features = True
+            self.n_gaussian_features = len(gaussian_features_names)
+            gaussian_features_names = sorted(gaussian_features_names, key = lambda x: int(x.split('_')[-1]))
+            gaussian_features = np.zeros((xyz.shape[0], len(gaussian_features_names)))
+            for idx, attr_name in enumerate(gaussian_features_names):
+                gaussian_features[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            print(f"[INFO] No gaussian features found in ply file.")
+            self.use_gaussian_features = False
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -732,11 +944,17 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        if len(semantic_names) > 0:
+            self._semantic = nn.Parameter(torch.tensor(semantic, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            self._semantic = nn.Parameter(torch.empty((xyz.shape[0], 0), dtype=torch.float, device="cuda").requires_grad_(False))
         if self.use_mip_filter:
             self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device="cuda")
         if self.learn_occupancy:
             self._base_occupancy = nn.Parameter(torch.tensor(base_occupancy, dtype=torch.float, device="cuda").requires_grad_(False), requires_grad=False)
             self._occupancy_shift = nn.Parameter(torch.tensor(occupancy_shift, dtype=torch.float, device="cuda").requires_grad_(True))
+        if self.use_gaussian_features:
+            self._gaussian_features = nn.Parameter(torch.tensor(gaussian_features, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -787,10 +1005,17 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if "semantic" in optimizable_tensors:
+            self._semantic = optimizable_tensors["semantic"]
+        else:
+            self._semantic = nn.Parameter(self._semantic[valid_points_mask].requires_grad_(self.num_classes > 0))
         if self.learn_occupancy:
             with torch.no_grad():
                 self._base_occupancy = nn.Parameter(self._base_occupancy[valid_points_mask].requires_grad_(False))
             self._occupancy_shift = optimizable_tensors["occupancy_shift"]
+        
+        if self.use_gaussian_features:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
             
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         if self.use_radegs_densification:
@@ -830,20 +1055,26 @@ class GaussianModel:
 
 
     def densification_postfix(
-        self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-        new_base_occupancy=None, new_occupancy_shift=None,
+        self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic,
+        new_base_occupancy=None, new_occupancy_shift=None, new_gaussian_features=None,
     ):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "semantic" : new_semantic}
         
         if self.learn_occupancy:
             if (new_base_occupancy is None) or (new_occupancy_shift is None):
                 raise ValueError("new_base_occupancy and new_occupancy_shift are required when learn_occupancy is True.")
             d["occupancy_shift"] = new_occupancy_shift
+        
+        if self.use_gaussian_features:
+            if (new_gaussian_features is None):
+                raise ValueError("new_gaussian_features is required when use_gaussian_features is True.")
+            d["gaussian_features"] = new_gaussian_features
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -852,9 +1083,15 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if "semantic" in optimizable_tensors:
+            self._semantic = optimizable_tensors["semantic"]
+        else:
+            self._semantic = nn.Parameter(torch.cat((self._semantic, new_semantic), dim=0).requires_grad_(self.num_classes > 0))
         if self.learn_occupancy:
             self._base_occupancy = torch.cat((self._base_occupancy, new_base_occupancy), dim=0)  # Do not require grad
             self._occupancy_shift = optimizable_tensors["occupancy_shift"]
+        if self.use_gaussian_features:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -890,6 +1127,57 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += (torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)*factor[update_filter])
         self.denom[update_filter] += 1        
 
+    
+    def densify_and_clone_from_mask(
+        self, 
+        selected_pts_mask, 
+        new_xyz: Optional[torch.Tensor]=None,
+        new_opacities: Optional[torch.Tensor]=None,
+        new_scaling: Optional[torch.Tensor]=None,
+        new_rotation: Optional[torch.Tensor]=None,
+        new_base_occupancy: Optional[torch.Tensor]=None,
+        new_occupancy_shift: Optional[torch.Tensor]=None,
+        new_semantic:  Optional[torch.Tensor]=None,
+        new_gaussian_features: Optional[torch.Tensor]=None,
+    ):
+        if new_xyz is None:
+            new_xyz = self._xyz[selected_pts_mask]
+        if new_opacities is None:
+            new_opacities = self._opacity[selected_pts_mask]
+        if new_scaling is None:
+            new_scaling = self._scaling[selected_pts_mask]
+        if new_rotation is None:
+            new_rotation = self._rotation[selected_pts_mask]
+        if new_semantic is None:
+            new_semantic = self._semantic[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+            
+        if self.learn_occupancy:
+            if (new_base_occupancy is None):
+                new_base_occupancy = self._base_occupancy[selected_pts_mask]
+            if (new_occupancy_shift is None):
+                new_occupancy_shift = self._occupancy_shift[selected_pts_mask]
+        else:
+            new_base_occupancy = None
+            new_occupancy_shift = None
+            
+        if self.use_gaussian_features:
+            if (new_gaussian_features is None):
+                new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        else:
+            new_gaussian_features = None
+
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
+            new_semantic, new_base_occupancy, new_occupancy_shift, new_gaussian_features
+        )
+
+        new_culling = self._culling[selected_pts_mask]
+        self._culling = torch.cat((self._culling, new_culling))
+        new_factor_culling = self.factor_culling[selected_pts_mask]
+        self.factor_culling = torch.cat((self.factor_culling, new_factor_culling))
+
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -903,6 +1191,7 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_semantic = self._semantic[selected_pts_mask]
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask]
@@ -910,10 +1199,15 @@ class GaussianModel:
         else:
             new_base_occupancy = None
             new_occupancy_shift = None
+        
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        else:
+            new_gaussian_features = None
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -941,6 +1235,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_semantic = self._semantic[selected_pts_mask].repeat(N,1)
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask].repeat(N,1)
@@ -948,10 +1243,15 @@ class GaussianModel:
         else:
             new_base_occupancy = None
             new_occupancy_shift = None
+        
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+        else:
+            new_gaussian_features = None
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1007,6 +1307,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_semantic = self._semantic[selected_pts_mask].repeat(N,1)
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask].repeat(N,1)
@@ -1014,10 +1315,15 @@ class GaussianModel:
         else:
             new_base_occupancy = None
             new_occupancy_shift = None
+        
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+        else:
+            new_gaussian_features = None
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1048,6 +1354,9 @@ class GaussianModel:
         if self.learn_occupancy:
             base_occupancy = torch.zeros((fused_point_cloud.shape[0], 9), dtype=torch.float, device="cuda")
             occupancy_shift = torch.zeros((fused_point_cloud.shape[0], 9), dtype=torch.float, device="cuda")
+        
+        if self.use_gaussian_features:
+            gaussian_features = torch.zeros((fused_point_cloud.shape[0], self.n_gaussian_features), dtype=torch.float, device="cuda")
 
         self._xyz = nn.Parameter(fused_point_cloud.contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -1055,10 +1364,14 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  
+        semantic = torch.zeros((fused_point_cloud.shape[0], self.num_classes), device="cuda")
+        self._semantic = nn.Parameter(semantic.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         if self.learn_occupancy:
             self._base_occupancy = nn.Parameter(base_occupancy.requires_grad_(False))
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))
+        if self.use_gaussian_features:
+            self._gaussian_features = nn.Parameter(gaussian_features.requires_grad_(True))
 
     def init_culling(self, num_views):
         self._culling=torch.zeros((self._xyz.shape[0], num_views), dtype=torch.bool, device='cuda')
@@ -1324,6 +1637,7 @@ class GaussianModel:
 
 
         new_rotation = self._rotation[selected_pts_mask]
+        new_semantic = self._semantic[selected_pts_mask]
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask]
@@ -1331,10 +1645,15 @@ class GaussianModel:
         else:
             new_base_occupancy = None
             new_occupancy_shift = None
+        
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        else:
+            new_gaussian_features = None
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1603,6 +1922,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_semantic = self._semantic[selected_pts_mask].repeat(N,1)
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask].repeat(N,1)
@@ -1611,9 +1931,14 @@ class GaussianModel:
             new_base_occupancy = None
             new_occupancy_shift = None
         
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+        else:
+            new_gaussian_features = None
+        
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
         
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1651,6 +1976,7 @@ class GaussianModel:
         # new_opacities = 1-torch.sqrt(1-self.get_opacity[selected_pts_mask]*0.5)
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_semantic = self._semantic[selected_pts_mask]
             
         if self.learn_occupancy:
             new_base_occupancy = self._base_occupancy[selected_pts_mask]
@@ -1658,10 +1984,15 @@ class GaussianModel:
         else:
             new_base_occupancy = None
             new_occupancy_shift = None
+        
+        if self.use_gaussian_features:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        else:
+            new_gaussian_features = None
 
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift
+            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic,
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1709,3 +2040,53 @@ class GaussianModel:
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,2:], dim=-1, keepdim=True)
         self.xyz_gradient_accum_abs_max[update_filter] = torch.max(self.xyz_gradient_accum_abs_max[update_filter], torch.norm(viewspace_point_tensor.grad[update_filter,2:], dim=-1, keepdim=True))
         self.denom[update_filter] += 1
+
+    def remove_low_score_gaussians(self, selected_pts_mask):
+        self._xyz = nn.Parameter(self._xyz[selected_pts_mask].requires_grad_(True))
+        self._features_dc = nn.Parameter(self._features_dc[selected_pts_mask].requires_grad_(True))
+        self._features_rest = nn.Parameter(self._features_rest[selected_pts_mask].requires_grad_(True))
+        self._opacity = nn.Parameter(self._opacity[selected_pts_mask].requires_grad_(True))
+        self._scaling = nn.Parameter(self._scaling[selected_pts_mask].requires_grad_(True))
+        self._rotation = nn.Parameter(self._rotation[selected_pts_mask].requires_grad_(True))
+        if self.num_classes > 0:
+            self._semantic = nn.Parameter(self._semantic[selected_pts_mask].requires_grad_(True))
+        else:
+            self._semantic = nn.Parameter(self._semantic[selected_pts_mask].requires_grad_(False))
+        if self.learn_occupancy:
+            self._base_occupancy = nn.Parameter(self._base_occupancy[selected_pts_mask].requires_grad_(False), requires_grad=False)
+            self._occupancy_shift = nn.Parameter(self._occupancy_shift[selected_pts_mask].requires_grad_(True))
+        
+        # Update auxiliary tensors
+        if self.max_radii2D.numel() > 0:
+            self.max_radii2D = self.max_radii2D[selected_pts_mask]
+        if self.xyz_gradient_accum.numel() > 0:
+            self.xyz_gradient_accum = self.xyz_gradient_accum[selected_pts_mask]
+        if self.denom.numel() > 0:
+            self.denom = self.denom[selected_pts_mask]
+        if self.use_mip_filter and hasattr(self, "filter_3D"):
+            self.filter_3D = self.filter_3D[selected_pts_mask]
+        if self.use_radegs_densification:
+            if hasattr(self, "xyz_gradient_accum_abs"):
+                self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[selected_pts_mask]
+            if hasattr(self, "xyz_gradient_accum_abs_max"):
+                self.xyz_gradient_accum_abs_max = self.xyz_gradient_accum_abs_max[selected_pts_mask]
+        if hasattr(self, "_culling"):
+            self._culling = self._culling[selected_pts_mask]
+        if hasattr(self, "factor_culling"):
+            self.factor_culling = self.factor_culling[selected_pts_mask]
+    
+    def apply_weights(self, camera, weights, weights_cnt, image_weights):
+        rasterizer = camera2rasterizer(
+            camera, torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+        )
+        rasterizer.apply_weights(
+            means3D=self.get_xyz,
+            opacities=self.get_opacity,
+            shs=None,
+            weights=weights,
+            scales=self.get_scaling,
+            rotations=self.get_rotation,
+            cov3Ds_precomp=None,
+            cnt=weights_cnt,
+            image_weights=image_weights,
+        )

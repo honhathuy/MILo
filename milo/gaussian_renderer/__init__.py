@@ -146,6 +146,9 @@ def render_imp(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tens
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity_with_3D_filter
+    semantic = pc.get_semantic
+    if semantic is None:
+        semantic = torch.empty((means3D.shape[0], 0), device="cuda")
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -179,7 +182,7 @@ def render_imp(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tens
         culling=torch.zeros(means3D.shape[0], dtype=torch.bool, device='cuda')
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, accum_max_count  = rasterizer(
+    rendered_image, semantic_map, radii, accum_max_count  = rasterizer(
         means3D = means3D,
         means2D = means2D,
         dc = dc,
@@ -190,11 +193,13 @@ def render_imp(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tens
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp,
+        semantic = semantic,
         flag_max_count=flag_max_count)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
+            "semantic": semantic_map,
             "viewspace_points": screenspace_points,
             "visibility_filter" : (radii > 0).nonzero(),
             "radii": radii,
@@ -398,13 +403,11 @@ def render_full(
     compute_accurate_median_depth_gradient=False,
 ):
     """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
+    Render the scene in a highly memory-efficient single-pass using diff_gaussian_rasterization.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    from diff_gaussian_rasterization_ms import GaussianRasterizationSettings, GaussianRasterizer
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
@@ -420,6 +423,7 @@ def render_full(
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
+        kernel_size=0.0,
         bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
@@ -427,6 +431,8 @@ def render_full(
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        require_depth=True,
+        require_coord=True,
         debug=pipe.debug
     )
 
@@ -435,6 +441,13 @@ def render_full(
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity_with_3D_filter
+    semantic = pc.get_semantic
+    if semantic is None:
+        semantic = torch.empty((means3D.shape[0], 0), device="cuda")
+
+    if culling is not None:
+        opacity = opacity.clone()
+        opacity[culling] = 0.0
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -449,7 +462,6 @@ def render_full(
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    dc = None  # TODO: Check if this is correct
     shs = None
     colors_precomp = None
     if override_color is None:
@@ -460,133 +472,46 @@ def render_full(
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            dc, shs = pc.get_features_dc, pc.get_features_rest
+            shs = pc.get_features
     else:
         colors_precomp = override_color
 
-    if culling==None:
-        culling=torch.zeros(means3D.shape[0], dtype=torch.bool, device='cuda')
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, accum_max_count  = rasterizer(
+    # Single-pass rasterizer execution
+    rendered_image, semantic_map, _, radii, accum_max_count, coord, mcoord, depth, mdepth, alpha, normal = rasterizer(
         means3D = means3D,
         means2D = means2D,
-        dc = dc,
-        shs = shs,
-        culling = culling,
-        colors_precomp = colors_precomp,
         opacities = opacity,
+        shs = shs,
+        colors_precomp = colors_precomp,
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp,
-        flag_max_count=flag_max_count)  # Gradient
+        semantic = semantic,
+        flag_max_count = flag_max_count
+    )
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    depth_render_pkg  = rasterizer.render_depth(
-        means3D = means3D,
-        means2D = means2D,
-        dc = dc,
-        shs = shs,
-        culling = culling,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)  # No gradient
-    
-    # Get index per pixel
-    gidx = depth_render_pkg['gidx'].squeeze()  # H, W
-    
-    # Get depth and normals per Gaussian
-    gaussians_normals = get_gaussian_normals_from_view(viewpoint_camera, pc, in_view_space=True)  # N_gaussians, 3
-    gaussians_depth = transform_points_world_to_view(pc.get_xyz, [viewpoint_camera])[0, ..., 2:]  # N_gaussians, 1
-    
-    # Get Median depth
-    if compute_accurate_median_depth_gradient:
-        gaussian_inv_sigmas = build_scaling_rotation(1. / pc.get_scaling_with_3D_filter, pc._rotation)  # N_gaussians, 3, 3
-        gaussian_inv_sigmas = gaussian_inv_sigmas @ gaussian_inv_sigmas.transpose(1, 2)  # N_gaussians, 3, 3
-        inv_sigmas = gaussian_inv_sigmas[gidx]  # H, W, 3, 3
-        centers = pc.get_xyz[gidx]  # H, W, 3
-        
-        camera_center = viewpoint_camera.camera_center.view(*([1] * (centers.ndim - 1)), 3)  # 1, 1, 3
-        rays = torch.nn.functional.normalize(depth_render_pkg['out_pts'].permute(1, 2, 0) - camera_center, dim=-1)  # H, W, 3
-        
-        rays_T_inv_sigmas = (inv_sigmas @ rays[..., None]).squeeze(-1)  # Equal to r^T * sigma^(-1);  H, W, 3
-        depth_points = camera_center + (
-            (rays_T_inv_sigmas * (centers - camera_center)).sum(dim=-1, keepdim=True)
-            / (rays_T_inv_sigmas * rays).sum(dim=-1, keepdim=True)
-        ) * rays  # Corresponds to the "ray-gaussian intersection", i.e. the point with max opacity along the ray;  H, W, 3
-        depth = transform_points_world_to_view(depth_points.view(-1, 3), [viewpoint_camera]).view(depth_points.shape)[..., 2][None]  # 1, H, W --Gradient
-    
-    else:
-        idx_depth = gaussians_depth[gidx].permute(2, 0, 1)  # 1, H, W --Gradient
-        depth = depth_render_pkg["rendered_depth"] - idx_depth.detach() + idx_depth  # 1, H, W --Gradient
-        
-    if compute_expected_depth:
-        expected_depth, _, _  = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = None,
-            culling = culling,
-            # colors_precomp = gaussians_depth.repeat(1, 3),
-            colors_precomp = torch.cat(
-                [gaussians_depth, torch.ones(gaussians_depth.shape[0], 2, device=gaussians_depth.device)],
-                dim=-1,
-            ),
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp,
-            flag_max_count=flag_max_count
-        )
-        expected_depth, expected_alpha = expected_depth[0:1], expected_depth[1:2]  # 1, H, W --Gradient
-    else:
-        expected_depth = None
-        expected_alpha = None
-    
-    if compute_expected_normals:
-        # TODO: Should we normalize?
-        normal_img, _, _  = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = None,
-            culling = culling,
-            colors_precomp = gaussians_normals,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp,
-            flag_max_count=flag_max_count
-        )  # 3, H, W --Gradient
-    else:
-        idx_normals = gaussians_normals[gidx].squeeze(-2).permute(2, 0, 1)  # 3, H, W --Gradient
-        normal_img = idx_normals  # 3, H, W --Gradient
-    
-    # Get other maps
-    alpha_img = depth_render_pkg['accum_alpha']  # 1, H, W --No gradient
-    out_pts = depth_render_pkg['out_pts']  # 1, H, W --No gradient
-    discriminants = depth_render_pkg['discriminants']  # 1, H, W --No gradient
+    # Expected depth and normals are natively computed with full autograd gradients in CUDA
+    expected_depth = depth if compute_expected_depth else None
+    expected_alpha = alpha if compute_expected_depth else None
+    normal_img = normal
 
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,  # 3, H, W --Gradient
+    return {"render": rendered_image,
+            "semantic": semantic_map,
             "viewspace_points": screenspace_points, 
             "visibility_filter" : (radii > 0).nonzero(),
             "radii": radii,  
             "area_max": accum_max_count,
-            "accum_alpha": alpha_img,  # 1, H, W --No gradient
-            "out_pts": out_pts,  # 3, H, W --No gradient
-            "discriminants": discriminants,  # 1, H, W --No gradient
-            "gaussian_idx": gidx,  # 1, H, W --No gradient
-            "median_depth": depth,  # 1, H, W --Gradient
+            "accum_alpha": alpha,  # 1, H, W
+            "out_pts": coord,  # 3, H, W
+            "discriminants": torch.zeros_like(alpha),
+            "gaussian_idx": torch.zeros_like(alpha, dtype=torch.long),
+            "median_depth": mdepth,  # 1, H, W --Gradient
             "expected_depth": expected_depth,  # 1, H, W --Gradient
             "normal": normal_img,  # 3, H, W --Gradient
             "expected_alpha": expected_alpha,  # 1, H, W --Gradient
             # TODO: Remove keys below
-            "rendered_depth": depth,  # 1, H, W --Gradient  TODO: Remove this
-            "rendered_normals": normal_img,  # 3, H, W --Gradient  TODO: Remove this
+            "rendered_depth": mdepth,  # 1, H, W --Gradient
+            "rendered_normals": normal_img,  # 3, H, W --Gradient
             }
 
 
@@ -641,6 +566,9 @@ def render_isosurface(
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity_with_3D_filter
+    semantic = pc.get_semantic
+    if semantic is None:
+        semantic = torch.empty((means3D.shape[0], 0), device="cuda")
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -674,7 +602,7 @@ def render_isosurface(
         culling=torch.zeros(means3D.shape[0], dtype=torch.bool, device='cuda')
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, accum_max_count  = rasterizer(
+    rendered_image, semantic_map, radii, accum_max_count  = rasterizer(
         means3D = means3D,
         means2D = means2D,
         dc = dc,
@@ -685,6 +613,7 @@ def render_isosurface(
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp,
+        semantic = semantic,
         flag_max_count=flag_max_count)  # Gradient
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
@@ -732,7 +661,7 @@ def render_isosurface(
     iso_depth = transform_points_world_to_view(depth_points.view(-1, 3), [viewpoint_camera]).view(depth_points.shape)[..., 2][None]  # 1, H, W --Gradient
         
     if compute_expected_depth:
-        expected_depth, _, _  = rasterizer(
+        expected_depth, _, _, _  = rasterizer(
             means3D = means3D,
             means2D = means2D,
             dc = dc,
@@ -747,6 +676,7 @@ def render_isosurface(
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp,
+            semantic = semantic,
             flag_max_count=flag_max_count
         )
         expected_depth, expected_alpha = expected_depth[0:1], expected_depth[1:2]  # 1, H, W --Gradient
@@ -767,6 +697,7 @@ def render_isosurface(
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp,
+            semantic = semantic,
             flag_max_count=flag_max_count
         )  # 3, H, W --Gradient
     else:
@@ -780,7 +711,8 @@ def render_isosurface(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,  # 3, H, W --Gradient
+    return {"render": rendered_image,
+            "semantic": semantic_map,
             "viewspace_points": screenspace_points, 
             "visibility_filter" : (radii > 0).nonzero(),
             "radii": radii,  
