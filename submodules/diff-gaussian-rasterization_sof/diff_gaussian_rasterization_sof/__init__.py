@@ -11,7 +11,7 @@
 
 import json
 import dacite
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import NamedTuple
 import torch.nn as nn
 import torch
@@ -230,7 +230,7 @@ class SortQueueSizes:
 
 @dataclass
 class SortSettings:
-    queue_sizes : SortQueueSizes = SortQueueSizes()
+    queue_sizes : SortQueueSizes = field(default_factory=SortQueueSizes)
     sort_mode : SortMode = SortMode.GLOBAL
     sort_order : GlobalSortOrder = GlobalSortOrder.Z_DEPTH
     
@@ -263,9 +263,9 @@ class MeshingSettings:
 
 @dataclass
 class ExtendedSettings:
-    sort_settings : SortSettings = SortSettings()
-    culling_settings : CullingSettings = CullingSettings()
-    meshing_settings : MeshingSettings = MeshingSettings()
+    sort_settings : SortSettings = field(default_factory=SortSettings)
+    culling_settings : CullingSettings = field(default_factory=CullingSettings)
+    meshing_settings : MeshingSettings = field(default_factory=MeshingSettings)
     load_balancing : bool = False
     proper_ewa_scaling : bool = False
     exact_depth : bool = True

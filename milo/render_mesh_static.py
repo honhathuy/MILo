@@ -28,11 +28,13 @@ def render_set_static(output_path, name, views, mesh_obj, renderer):
 
     for idx, view in enumerate(tqdm(views, desc=f"Rendering {name} progress")):
         with torch.no_grad():
+            # Set max_triangles_in_batch to 1,000,000 to prevent nvdiffrast subtriangle count overflow
             rendered_pkg = renderer(
                 mesh=mesh_obj,
                 cameras=view,
                 cam_idx=0,
-                use_antialiasing=True
+                use_antialiasing=True,
+                max_triangles_in_batch=1000000
             )
         rendering = rendered_pkg["rgb"].squeeze(0).permute(2, 0, 1) # [3, H, W]
         gt = view.original_image[0:3, :, :]
