@@ -1,7 +1,18 @@
 import json
 import os
 from os import makedirs
+import sys
 import torch
+import torch.utils.cpp_extension
+_original_load = torch.utils.cpp_extension.load
+def _patched_load(*args, **kwargs):
+    module = _original_load(*args, **kwargs)
+    if module is not None:
+        name = kwargs.get('name') or (args[0] if len(args) > 0 else None)
+        if name:
+            sys.modules[name] = module
+    return module
+torch.utils.cpp_extension.load = _patched_load
 import torchvision
 from random import randint
 from tqdm import tqdm
