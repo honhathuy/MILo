@@ -1,7 +1,19 @@
 #adopted from https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/extract_mesh.py
+import sys
+import torch
+import torch.utils.cpp_extension
+_original_load = torch.utils.cpp_extension.load
+def _patched_load(*args, **kwargs):
+    module = _original_load(*args, **kwargs)
+    if module is not None:
+        name = kwargs.get('name') or (args[0] if len(args) > 0 else None)
+        if name:
+            sys.modules[name] = module
+    return module
+torch.utils.cpp_extension.load = _patched_load
+
 from typing import List
 import numpy as np
-import torch
 from functools import partial
 from scene import Scene
 import os
