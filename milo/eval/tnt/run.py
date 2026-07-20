@@ -38,8 +38,8 @@
 import numpy as np
 import open3d as o3d
 import os
-import argparse
-# import torch
+import argpars
+import torch
 
 from config import scenes_tau_dict
 from registration import (
@@ -48,7 +48,7 @@ from registration import (
     registration_unif,
     read_trajectory,
 )
-# from help_func import auto_orient_and_center_poses
+from help_func import auto_orient_and_center_poses
 from trajectory_io import CameraPose
 from evaluation import EvaluateHisto
 from util import make_dir
