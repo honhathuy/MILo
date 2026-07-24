@@ -143,15 +143,15 @@ def compute_trajectory_transform(mesh_o3d, trajectory_transform, gt_pcd, crop_vo
     print(f"[INFO] First ICP iteration --------------------------------")
     pcd_icp1 = sample_points_from_mesh(mesh_o3d, int(1e6), trajectory_transform, crop_volume)
     r2 = registration_vol_ds(pcd_icp1, gt_pcd, trajectory_transform, crop_volume, dTau,
-                             dTau * 80, n_icp_iterations, debug_path=debug_path + ".first_icp.ply" if debug_path is not None else None)
+                             dTau * 80, n_icp_iterations, debug_path=debug_path + ".first_icp.ply" if debug_path is not None else None, already_cropped=True)
     print(f"[INFO] Second ICP iteration --------------------------------")
     pcd_icp2 = sample_points_from_mesh(mesh_o3d, int(1e6), r2.transformation, crop_volume)
     r3 = registration_vol_ds(pcd_icp2, gt_pcd, r2.transformation, crop_volume, dTau / 2.0,
-                             dTau * 20, n_icp_iterations, debug_path=debug_path + ".second_icp.ply" if debug_path is not None else None)
+                             dTau * 20, n_icp_iterations, debug_path=debug_path + ".second_icp.ply" if debug_path is not None else None, already_cropped=True)
     print(f"[INFO] Third ICP iteration --------------------------------")
     pcd_icp3 = sample_points_from_mesh(mesh_o3d, int(1e6), r3.transformation, crop_volume)
     r = registration_unif(pcd_icp3, gt_pcd, r3.transformation, crop_volume, 
-                             2 * dTau, n_icp_iterations, debug_path=debug_path + ".third_icp.ply" if debug_path is not None else None)
+                             2 * dTau, n_icp_iterations, debug_path=debug_path + ".third_icp.ply" if debug_path is not None else None, already_cropped=True)
 
     trajectory_transform = r.transformation
 

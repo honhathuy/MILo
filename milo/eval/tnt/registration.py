@@ -140,7 +140,7 @@ def registration_unif(
     max_size=4 * MAX_POINT_NUMBER,
     verbose=True,
     debug_path=None,
-    already_cropped=True,
+    already_cropped=False,
 ):
     if verbose:
         print("[Registration] threshold: %f" % threshold)
@@ -185,7 +185,7 @@ def registration_vol_ds(
     max_itr,
     verbose=True,
     debug_path=None,
-    already_cropped=True,
+    already_cropped=False,
 ):
     if verbose:
         print("[Registration] voxel_size: %f, threshold: %f" %
