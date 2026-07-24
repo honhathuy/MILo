@@ -63,8 +63,7 @@ def gen_sparse_trajectory(mapping, f_trajectory):
     return sparse_traj
 
 
-def trajectory_alignment(map_file, traj_to_register, gt_traj_col, gt_trans,
-                         scene):
+def trajectory_alignment(map_file, traj_to_register, gt_traj_col, gt_trans, scene=None):
     traj_pcd_col = convert_trajectory_to_pointcloud(gt_traj_col)
     if gt_trans is not None:
         traj_pcd_col.transform(gt_trans)
@@ -140,14 +139,27 @@ def registration_unif(
     max_itr,
     max_size=4 * MAX_POINT_NUMBER,
     verbose=True,
+    debug_path=None,
+    already_cropped=True,
 ):
     if verbose:
         print("[Registration] threshold: %f" % threshold)
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
-    s = crop_and_downsample(source,
+    if not already_cropped:
+        print(f"[WARNING] Cropping and downsampling source point cloud")
+        s = crop_and_downsample(source,
                             crop_volume,
                             down_sample_method="uniform",
                             trans=init_trans)
+    else:
+        print(f"[WARNING] Assuming source point cloud is already cropped and downsampled")
+        s = copy.deepcopy(source)
+
+    if debug_path is not None:
+        assert debug_path.endswith(".ply")
+        pcd_copy = copy.deepcopy(source)
+        transformed_source = pcd_copy.transform(init_trans)
+        o3d.io.write_point_cloud(debug_path, transformed_source)
     t = crop_and_downsample(gt_target,
                             crop_volume,
                             down_sample_method="uniform")
@@ -172,18 +184,31 @@ def registration_vol_ds(
     threshold,
     max_itr,
     verbose=True,
+    debug_path=None,
+    already_cropped=True,
 ):
     if verbose:
         print("[Registration] voxel_size: %f, threshold: %f" %
               (voxel_size, threshold))
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
-    s = crop_and_downsample(
-        source,
-        crop_volume,
-        down_sample_method="voxel",
-        voxel_size=voxel_size,
-        trans=init_trans,
-    )
+    if not already_cropped:
+        print(f"[WARNING] Cropping and downsampling source point cloud")
+        s = crop_and_downsample(
+            source,
+            crop_volume,
+            down_sample_method="voxel",
+            voxel_size=voxel_size,
+            trans=init_trans,
+        )
+    else:
+        print(f"[WARNING] Assuming source point cloud is already cropped and downsampled")
+        s = copy.deepcopy(source)
+
+    if debug_path is not None:
+        assert debug_path.endswith(".ply")
+        pcd_copy = copy.deepcopy(source)
+        transformed_source = pcd_copy.transform(init_trans)
+        o3d.io.write_point_cloud(debug_path, transformed_source)
     t = crop_and_downsample(
         gt_target,
         crop_volume,

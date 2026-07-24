@@ -57,6 +57,48 @@ def write_color_distances(path, pcd, distances, max_distance):
     o3d.io.write_point_cloud(path, pcd)
 
 
+def EvaluateHistoSimple(
+    distance1,
+    distance2,
+    threshold,
+    filename_mvs,
+    plot_stretch,
+    scene_name,
+    verbose=True,
+):
+    print("[EvaluateHisto]")
+    if verbose:
+        o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
+
+    # get histogram and f-score
+    [
+        precision,
+        recall,
+        fscore,
+        edges_source,
+        cum_source,
+        edges_target,
+        cum_target,
+    ] = get_f1_score_histo2(threshold, filename_mvs, plot_stretch, distance1,
+                            distance2)
+    np.savetxt(filename_mvs + "/" + scene_name + ".recall.txt", cum_target)
+    np.savetxt(filename_mvs + "/" + scene_name + ".precision.txt", cum_source)
+    np.savetxt(
+        filename_mvs + "/" + scene_name + ".prf_tau_plotstr.txt",
+        np.array([precision, recall, fscore, threshold, plot_stretch]),
+    )
+
+    return [
+        precision,
+        recall,
+        fscore,
+        edges_source,
+        cum_source,
+        edges_target,
+        cum_target,
+    ]
+
+
 def EvaluateHisto(
     source,
     target,
@@ -184,7 +226,10 @@ def get_f1_score_histo2(threshold,
             len(distance2))
         precision = float(sum(d < threshold for d in distance1)) / float(
             len(distance1))
-        fscore = 2 * recall * precision / (recall + precision)
+        if recall + precision > 0:
+            fscore = 2 * recall * precision / (recall + precision)
+        else:
+            fscore = 0.0
         num = len(distance1)
         bins = np.arange(0, dist_threshold * plot_stretch, dist_threshold / 100)
         hist, edges_source = np.histogram(distance1, bins)
