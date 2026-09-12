@@ -73,13 +73,15 @@ def training(
     if args.use_normal_field:
         n_gaussian_features = 4
 
+    sh_degree = dataset.sh_degree if args.use_sh else 0
     gaussians = GaussianModel(
-        sh_degree=0, 
+        sh_degree=sh_degree, 
         num_classes=0,
         use_mip_filter=use_mip_filter, 
         learn_occupancy=args.mesh_regularization,
         use_appearance_network=args.decoupled_appearance,
         n_gaussian_features=n_gaussian_features,
+        use_radegs_densification=True,
     )
     if getattr(dataset, "no_depth_prior", False) and args.depth_order:
         raise ValueError("Cannot use --depth_order when --no_depth_prior is specified. Please disable depth order prior regularization if you wish to disable loading depth/normal maps.")
@@ -152,7 +154,7 @@ def training(
     start_normal_densification = 5000
     end_normal_densification = 12000
     densify_normal_every_n_iterations = 1000
-    start_multiview = 8000
+    start_multiview = 15000
     enable_normal_field_densification = False
 
     # ---Start optimization loop---    
@@ -164,7 +166,7 @@ def training(
         gaussians.update_learning_rate(iteration)
 
         # ---Update SH degree---
-        if args.use_sh and iteration % 1000 == 0 and iteration>args.simp_iteration1:
+        if args.use_sh and iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # ---Select random viewpoint---
@@ -384,112 +386,18 @@ def training(
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats_radegs(viewspace_point_tensor, visibility_filter)
 
-                if gaussians._culling[:,viewpoint_cam.uid].sum()==0:
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                else:
-                    # normalize xy gradient after culling
-                    gaussians.add_densification_stats_culling(viewspace_point_tensor, visibility_filter, gaussians.factor_culling)
-
-                area_max = render_pkg["area_max"]
-                mask_blur = torch.logical_or(mask_blur, area_max>(image.shape[1]*image.shape[2]/5000))
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold, 
-                                                    0.005, scene.cameras_extent, 
-                                                    size_threshold, mask_blur)
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
+                    gaussians.densify_and_prune_radegs(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold)
+                    if not use_mip_filter:
+                        gaussians.reset_3D_filter()
+                    else:
+                        gaussians.compute_3D_filter(cameras=scene.getTrainCameras().copy())
 
-                if iteration == args.depth_reinit_iter:
-                    num_depth = gaussians._xyz.shape[0]*args.num_depth_factor
-
-                    # interesction_preserving for better point cloud reconstruction result at the early stage, not affect rendering quality
-                    gaussians.interesction_preserving(scene, render_simp, iteration, args, pipe, background)
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-
-                    pts, rgb = gaussians.depth_reinit(scene, render_depth, iteration, num_depth, args, pipe, background)
-
-                    gaussians.reinitial_pts(pts, rgb)
-
-                    gaussians.training_setup(opt)
-                    gaussians.init_culling(len(scene.getTrainCameras()))
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    torch.cuda.empty_cache()
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-
-                if iteration >= args.aggressive_clone_from_iter and iteration % args.aggressive_clone_interval == 0 and iteration!=args.depth_reinit_iter and not args.dense_init:
-                    gaussians.culling_with_clone(scene, render_simp, iteration, args, pipe, background)
-                    torch.cuda.empty_cache()
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-
-            # ---Pruning and simplification---
-            if iteration == args.simp_iteration1:
-                if args.dense_gaussians:
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
-                else:
-                    gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
-                if args.use_sh:
-                    gaussians.max_sh_degree = dataset.sh_degree
-                    gaussians.extend_features_rest()
-
-                gaussians.training_setup(opt)
-                torch.cuda.empty_cache()
-                if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-
-            if iteration == (args.simp_iteration1+2000):
-                gaussians.init_culling(len(scene.getTrainCameras()))
-
-            if args.use_normal_field and enable_normal_field_densification:
-                cond_1 = normal_field_kick_on
-                cond_2 = (
-                    (iteration+1 >= start_normal_densification)
-                    and (iteration+1 <= end_normal_densification)
-                )
-                cond_3 = (
-                    (iteration+1 - start_normal_densification) % densify_normal_every_n_iterations == 0
-                )
-                if cond_1 and cond_2 and cond_3:
-                    print(f"[INFO] Densifying normal field at iteration {iteration+1}.")
-                    print(f"        > Number of Gaussians before densification: {gaussians._xyz.shape[0]}.")
-                    densify_normal_field(
-                        gaussians=gaussians, 
-                        cameras=scene.getTrainCameras().copy(), 
-                        pipe=pipe, 
-                        background=background, 
-                        render_func=render, 
-                        args=args,
-                        maintain_constant_volume=True,
-                    )
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    print(f"        > Number of Gaussians after densification: {gaussians._xyz.shape[0]}.")
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # ---Update 3D Mip Filter---
             if use_mip_filter and (
@@ -497,7 +405,7 @@ def training(
                 or (iteration % args.update_mip_filter_every == 0)
             ):
                 if iteration < opt.iterations - args.update_mip_filter_every:
-                    gaussians.compute_3D_filter(cameras=scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy())
+                    gaussians.compute_3D_filter(cameras=scene.getTrainCameras().copy())
                 else:
                     print(f"[INFO] Skipping 3D Mip Filter update at iteration {iteration}")
 
@@ -635,7 +543,7 @@ if __name__ == "__main__":
     parser.add_argument("--decoupled_appearance", action="store_true")
 
     # ----- Spherical Harmonics (SH) -----
-    parser.add_argument("--use_sh", "--enable_sh", action="store_true", default=True,
+    parser.add_argument("--use_sh", "--enable_sh", action="store_true", default=False,
                         help="Enable higher-degree spherical harmonics progression; if set to False, sticks to 0 degree diffuse only. Default set to True.")
 
     # ----- Logging -----
@@ -645,7 +553,6 @@ if __name__ == "__main__":
     
     args = parser.parse_args(sys.argv[1:])
 
-    args = read_config(parser)
     args.save_iterations.append(args.iterations)
     if not -1 in args.test_iterations:
         args.test_iterations.append(args.iterations)
