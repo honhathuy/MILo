@@ -219,11 +219,12 @@ def training(
                 compute_expected_depth=True,
                 compute_accurate_median_depth_gradient=True,
             )
-        # If no regularization is active, we just use the default Mini-Splatting2 rasterizer.
+        # If no regularization is active, we use the default radegs rasterizer for proper 3D gradients.
         else:
-            render_pkg = render_imp(
-                viewpoint_cam, gaussians, pipe, background, 
-                culling=gaussians._culling[:,viewpoint_cam.uid],
+            render_pkg = render(
+                viewpoint_cam, gaussians, pipe, background,
+                require_coord=False, require_depth=False,
+                flag_max_count=False,
             )
 
         # ---Compute losses---
@@ -386,11 +387,11 @@ def training(
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats_radegs(viewspace_point_tensor, visibility_filter)
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune_radegs(opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                     if not use_mip_filter:
                         gaussians.reset_3D_filter()
                     else:
