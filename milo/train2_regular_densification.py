@@ -544,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument("--decoupled_appearance", action="store_true")
 
     # ----- Spherical Harmonics (SH) -----
-    parser.add_argument("--use_sh", "--enable_sh", action="store_true", default=False,
+    parser.add_argument("--use_sh", "--enable_sh", action="store_true", default=True,
                         help="Enable higher-degree spherical harmonics progression; if set to False, sticks to 0 degree diffuse only. Default set to True.")
 
     # ----- Logging -----
