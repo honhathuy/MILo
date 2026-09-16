@@ -289,31 +289,81 @@ class RenderWithColorField(torch.nn.Module):
         grad_vars = color_field.get_optparam_groups()
         self.color_field = color_field
         self.optimizer = torch.optim.Adam(grad_vars, betas=(0.9,0.99))
+        self.cache = {}
 
     def forward(self, viewpoint_idx : int, viewpoint_cam : any, mesh_renderer : MeshRenderer, training : bool = True, n_random_points : int = -1, min_number_of_faces : int = 50) -> torch.Tensor:
-        # Filter out faces not in view frustum
-        with torch.no_grad():
-            faces_mask = is_in_view_frustum(self.mesh.verts, viewpoint_cam)[self.mesh.faces].any(axis=1)
-        mesh_culled = Meshes(verts=self.mesh.verts, faces=self.mesh.faces[faces_mask])
-        if mesh_culled.faces.shape[0] < min_number_of_faces:
-            return None
-        try:
-            mesh_render_pkg = mesh_renderer(
-                    mesh_culled,
-                    cam_idx=viewpoint_idx,
-                    return_depth=True,
-                    return_normals=True
-            )
-        except:
-            return None
-        mesh_depth = mesh_render_pkg["depth"].squeeze()
-        mesh_normal = mesh_render_pkg["normals"].squeeze()
+        cache_key = id(viewpoint_cam)
+        if cache_key in self.cache:
+            coords_cpu, directions_cpu, normal_cpu, is_empty = self.cache[cache_key]
+            if is_empty:
+                return None
+        else:
+            # Filter out faces not in view frustum
+            with torch.no_grad():
+                faces_mask = is_in_view_frustum(self.mesh.verts, viewpoint_cam)[self.mesh.faces].any(axis=1)
+            mesh_culled = Meshes(verts=self.mesh.verts, faces=self.mesh.faces[faces_mask])
+            if mesh_culled.faces.shape[0] < min_number_of_faces:
+                self.cache[cache_key] = (None, None, None, True)
+                return None
+            try:
+                mesh_render_pkg = mesh_renderer(
+                        mesh_culled,
+                        cam_idx=viewpoint_idx,
+                        return_depth=True,
+                        return_normals=True,
+                        max_triangles_in_batch=9000000
+                )
+            except:
+                self.cache[cache_key] = (None, None, None, True)
+                return None
+            mesh_depth = mesh_render_pkg["depth"].squeeze()
+            mesh_normal = mesh_render_pkg["normals"].squeeze()
 
-        mesh_color = map_depth_and_normal_to_color(depth_map=mesh_depth, 
-                                        normal_map=mesh_normal, 
-                                        color_field=self.color_field, 
-                                        camera_view=viewpoint_cam, 
-                                        show_progress=False,
-                                        chunk_size=500_000,
-                                        max_random_points= n_random_points if training else -1)
-        return mesh_color
+            # Transform depth and normal maps to world space once
+            epsilon = 1e-6
+            world_coords, ray_directions = depths_to_points_and_rays_d(view=viewpoint_cam, depthmap1=mesh_depth)
+            world_coords = world_coords.view(3, -1).permute(1, 0).unsqueeze(0)
+            world_coords = transform_points_view_to_world(world_coords, [viewpoint_cam]).squeeze(0)
+
+            ray_directions = ray_directions.reshape(3, -1).permute(1, 0).unsqueeze(0)
+            image_plane_coords = transform_points_view_to_world(ray_directions, [viewpoint_cam]).squeeze(0)
+            view_directions = world_coords - image_plane_coords
+            view_directions_norm = view_directions.norm(dim=-1, keepdim=True)
+            view_directions_normalized = view_directions / (view_directions_norm + epsilon)
+
+            normal_map_flat = mesh_normal.view(-1, 3)
+
+            coords_cpu = world_coords.cpu()
+            directions_cpu = view_directions_normalized.cpu()
+            normal_cpu = normal_map_flat.cpu()
+            self.cache[cache_key] = (coords_cpu, directions_cpu, normal_cpu, False)
+
+        chunk_size = 500_000
+        max_random_points = n_random_points if training else -1
+        
+        num_points = coords_cpu.size(0)
+        color_output = torch.zeros((num_points, 3), device="cuda")
+
+        random_mask = None
+        if max_random_points > 0:
+            random_mask = torch.randperm(num_points)[:max_random_points]
+            coords_subset = coords_cpu[random_mask].cuda()
+            directions_subset = directions_cpu[random_mask].cuda()
+            normal_subset = normal_cpu[random_mask].cuda()
+            
+            for i in range(0, coords_subset.size(0), chunk_size):
+                c_chunk = coords_subset[i:i + chunk_size]
+                d_chunk = directions_subset[i:i + chunk_size]
+                n_chunk = normal_subset[i:i + chunk_size]
+                color_chunk = self.color_field(c_chunk, view_directions=d_chunk, normal_directions=n_chunk)
+                color_output[random_mask[i:i + chunk_size].to(color_output.device)] = color_chunk
+        else:
+            for i in range(0, num_points, chunk_size):
+                c_chunk = coords_cpu[i:i + chunk_size].cuda()
+                d_chunk = directions_cpu[i:i + chunk_size].cuda()
+                n_chunk = normal_cpu[i:i + chunk_size].cuda()
+                color_chunk = self.color_field(c_chunk, view_directions=d_chunk, normal_directions=n_chunk)
+                color_output[i:i + chunk_size] = color_chunk
+
+        color_output = color_output.permute(1, 0)
+        return color_output.view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)
