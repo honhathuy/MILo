@@ -32,6 +32,7 @@ def marching_tetrahedra_with_binary_search(
     n_binary_steps=8,
     isosurface_value=0.5,
     trunc_margin=None,
+    skip_color=False,
 ):    
     # Sample a subset of Gaussians for generating Gaussian pivots
     n_nonzero = (gaussians._base_occupancy != 0.).any(dim=-1).sum().item() if gaussians.learn_occupancy else 0
@@ -124,14 +125,19 @@ def marching_tetrahedra_with_binary_search(
         points = (left_points + right_points) / 2
 
     # Compute vertex colors
-    print("[INFO] Computing vertex colors...")
-    point_colors = evaluate_mesh_colors_all_vertices(
-        views=views, 
-        mesh=Meshes(verts=points, faces=faces),
-        masks=None,
-        use_scalable_renderer=True,
-    )
-    point_colors=(point_colors.cpu().numpy() * 255).astype(np.uint8)
+    if not skip_color:
+        print("[INFO] Computing vertex colors...")
+        point_colors = evaluate_mesh_colors_all_vertices(
+            views=views, 
+            mesh=Meshes(verts=points, faces=faces),
+            masks=None,
+            use_scalable_renderer=True,
+        )
+        if point_colors is not None:
+            point_colors = (point_colors.cpu().numpy() * 255).astype(np.uint8)
+    else:
+        print("[INFO] Skipping vertex color computation.")
+        point_colors = None
     
     # Create mesh
     points = points.cpu().numpy()
@@ -158,10 +164,12 @@ def extract_mesh(
     n_delaunay_sites=None, mtet_on_cpu=False, 
     sdf_mode="integration", n_binary_steps=8, 
     isosurface_value=0.5, trunc_margin=None,
+    skip_color=False,
 ):
     with torch.no_grad():
         # Load scene and Gaussian model
-        gaussians = GaussianModel(dataset.sh_degree)
+        num_classes = getattr(dataset, "num_classes", 0)
+        gaussians = GaussianModel(sh_degree=dataset.sh_degree, num_classes=num_classes)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"))
         if gaussians.learn_occupancy:
@@ -199,6 +207,7 @@ def extract_mesh(
             n_binary_steps=n_binary_steps,
             isosurface_value=isosurface_value,
             trunc_margin=trunc_margin,
+            skip_color=skip_color,
         )
 
 if __name__ == "__main__":
@@ -222,6 +231,7 @@ if __name__ == "__main__":
                         help="Max number of pivots to use for Delaunay triangulation.")
     parser.add_argument("--imp_metric", default='none', type=str)
     parser.add_argument("--warn_until_iter", default=3000, type=int)
+    parser.add_argument("--skip_color", action="store_true", help="Skip computing vertex colors")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -270,5 +280,6 @@ if __name__ == "__main__":
         n_binary_steps=args.n_binary_steps,
         isosurface_value=args.isosurface_value,
         trunc_margin=args.trunc_margin,
+        skip_color=args.skip_color,
     )
     
